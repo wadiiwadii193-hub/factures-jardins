@@ -1,0 +1,11 @@
+streamlit>=1.40
+openpyxl>=3.1
+pandas>=2.0
+pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.9
+pytesseract>=0.3.10
+pymupdf>=1.24
+requests>=2.31
+# Optionnel (lourd, ~2 Go avec PyTorch) : moteur OCR alternatif
+# easyocr
