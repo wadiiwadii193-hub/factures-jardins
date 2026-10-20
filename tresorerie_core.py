@@ -569,13 +569,18 @@ def find_date(text: str, today: dt.date | None = None) -> dt.date | None:
 _GENERIC = {"achat", "achats", "divers", "diverses", "fourniture", "fournitures", "frais", "total"}
 _SYNONYMES = {"carburant": ["essence", "gazole", "diesel", "sans plomb", "sp95", "sp98", "e10"],
               "assurance": ["assurance", "cotisation assurance", "attestation"],
-              "bureau": ["papeterie", "cartouche", "ramette", "stylo"],
+              "bureau": ["bureautique", "papeterie", "cartouche", "ramette", "stylo", "classeur", "agrafe"],
               "fumier": ["fumier", "compost"]}
+# Lignes qui décrivent seulement le MOYEN DE PAIEMENT : elles ne disent rien sur la nature de l'achat
+# (« carte bancaire » figure sur presque tous les tickets de caisse).
+_PAIEMENT = re.compile(r"carte (bancaire|bleue|banc)|\b(cb|visa|mastercard|espece|especes|paiement|reglement|"
+                       r"sans contact|contactless|monnaie rendue)\b")
 
 
 def suggest_category(text: str, labels: list[str]) -> int | None:
-    """Index de la catégorie la plus plausible d'après les mots de la facture (ou None)."""
-    t = norm(text)
+    """Index de la catégorie la plus plausible d'après la nature de l'achat (ou None si aucun indice net)."""
+    lignes = [l for l in text.splitlines() if not _PAIEMENT.search(norm(l))]
+    t = norm(" ".join(lignes))
     best_i, best = None, 0
     for i, label in enumerate(labels):
         score = 0
@@ -588,3 +593,18 @@ def suggest_category(text: str, labels: list[str]) -> int | None:
         if score > best:
             best_i, best = i, score
     return best_i
+
+
+def prepare_justificatif(data: bytes, filename: str, preview: Image.Image, max_pdf: int = 4_000_000):
+    """
+    Pièce justificative à conserver : (octets, type MIME).
+    PDF d'origine s'il est léger, sinon image JPEG réduite (1600 px, qualité 80 : environ 300 Ko).
+    """
+    is_pdf = filename.lower().endswith(".pdf") or data[:5] == b"%PDF-"
+    if is_pdf and len(data) <= max_pdf:
+        return data, "application/pdf"
+    img = ImageOps.exif_transpose(preview).convert("RGB")
+    img.thumbnail((1600, 1600))
+    out = io.BytesIO()
+    img.save(out, "JPEG", quality=80, optimize=True)
+    return out.getvalue(), "image/jpeg"

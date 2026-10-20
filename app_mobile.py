@@ -182,13 +182,17 @@ if not auteur.strip():
     st.caption("Indiquez votre prénom pour pouvoir envoyer.")
 
 if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
+    photo, photo_type = core.prepare_justificatif(data, name, preview)
     try:
-        cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur.strip(), date_facture=date_in.isoformat(),
-                        categorie=cat, montant=amount_in, source=f"mobile:{name}", entry_id=entry_id)
+        res = cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur.strip(), date_facture=date_in.isoformat(),
+                              categorie=cat, montant=amount_in, source=f"mobile:{name}", entry_id=entry_id,
+                              photo=photo, photo_type=photo_type)
     except cloud.CloudError as e:
         st.error(f"Envoi impossible : {e}")
     else:
-        st.session_state["message"] = (f"✅ Envoyé : {eur(amount_in)} · {cat} · "
-                                       f"{MOIS[date_in.month - 1]}. Merci !")
+        msg = f"✅ Envoyé : {eur(amount_in)} · {cat} · {MOIS[date_in.month - 1]}. Merci !"
+        if res.get("photo_erreur"):
+            msg += " (La facture est bien enregistrée, mais sa photo n'a pas pu être conservée.)"
+        st.session_state["message"] = msg
         st.session_state["n"] = n + 1
         st.rerun()

@@ -6,6 +6,7 @@ Réglages lus dans cet ordre : variables d'environnement, puis fichier config_cl
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import uuid
@@ -62,14 +63,27 @@ def ping(url: str, token: str) -> bool:
 
 
 def add_entry(url: str, token: str, *, auteur: str, date_facture: str, categorie: str,
-              montant: float, source: str = "", entry_id: str | None = None) -> dict:
-    return _call(url, token, "add", {
-        "id": entry_id or uuid.uuid4().hex, "auteur": auteur, "date_facture": date_facture,
-        "categorie": categorie, "montant": round(float(montant), 2), "source": source})
+              montant: float, source: str = "", entry_id: str | None = None,
+              photo: bytes | None = None, photo_type: str = "image/jpeg",
+              deja_appliquee: bool = False) -> dict:
+    """Dépose une facture dans le Google Sheet (et sa photo dans le Drive si `photo` est fournie)."""
+    payload = {"id": entry_id or uuid.uuid4().hex, "auteur": auteur, "date_facture": date_facture,
+               "categorie": categorie, "montant": round(float(montant), 2), "source": source}
+    if photo:
+        payload["photo_b64"] = base64.b64encode(photo).decode("ascii")
+        payload["photo_type"] = photo_type
+    if deja_appliquee:
+        payload["statut"] = "appliqué"
+    return _call(url, token, "add", payload)
 
 
 def list_pending(url: str, token: str) -> list[dict]:
     return _call(url, token, "list_pending", method="GET")["rows"]
+
+
+def list_all(url: str, token: str) -> list[dict]:
+    """Toutes les factures (à traiter et appliquées), avec le lien de la photo."""
+    return _call(url, token, "list_all", method="GET")["rows"]
 
 
 def mark_applied(url: str, token: str, ids) -> int:
