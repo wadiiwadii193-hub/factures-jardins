@@ -23,29 +23,42 @@ import cloud_client as cloud
 
 
 def _charger_core():
-    """Charge tresorerie_core.py, même si son nom a reçu un accent sur GitHub (trésorerie_core.py)."""
+    """
+    Charge la version À JOUR de tresorerie_core.py, même si GitHub en garde plusieurs exemplaires
+    (nom avec ou sans accent : trésorerie_core.py).
+    """
+    ici = pathlib.Path(__file__).resolve().parent
+
+    def sans_accent(texte):
+        return "".join(c for c in unicodedata.normalize("NFKD", texte) if not unicodedata.combining(c))
+
+    vus = []
     try:
-        import tresorerie_core
-        return tresorerie_core
+        import tresorerie_core as exact
+        if hasattr(exact, "prepare_justificatif"):
+            return exact
+        vus.append("tresorerie_core.py (ancienne version)")
     except ModuleNotFoundError:
         pass
-    ici = pathlib.Path(__file__).resolve().parent
-    for fichier in ici.glob("*.py"):
-        sans_accent = "".join(c for c in unicodedata.normalize("NFKD", fichier.stem)
-                              if not unicodedata.combining(c))
-        if sans_accent == "tresorerie_core":
-            spec = importlib.util.spec_from_file_location("tresorerie_core", fichier)
-            module = importlib.util.module_from_spec(spec)
+    for i, fichier in enumerate(sorted(ici.glob("*.py"))):
+        if sans_accent(fichier.stem) != "tresorerie_core":
+            continue
+        nom = f"tresorerie_core_{i}"
+        spec = importlib.util.spec_from_file_location(nom, fichier)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[nom] = module
+        spec.loader.exec_module(module)
+        if hasattr(module, "prepare_justificatif"):
             sys.modules["tresorerie_core"] = module
-            spec.loader.exec_module(module)
             return module
-    raise ModuleNotFoundError("Le fichier tresorerie_core.py est introuvable dans le dépôt GitHub.")
+        vus.append(f"{fichier.name} (ancienne version)")
+    raise ModuleNotFoundError("Version à jour de tresorerie_core.py introuvable. Fichiers vus : "
+                              + (", ".join(vus) or "aucun"))
 
-
-core = _charger_core()
 
 st.set_page_config(page_title="Factures jardins familiaux", page_icon="🧾", layout="centered")
-MOIS = [m.capitalize() for m in core.MOIS_FR]
+MOIS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre",
+        "Octobre", "Novembre", "Décembre"]
 
 
 def setting(name: str) -> str:
@@ -82,6 +95,16 @@ if ACCESS_CODE and not st.session_state.get("autorise"):
     st.stop()
 
 
+# Les modules lourds (lecture des factures) ne sont chargés qu'après le code d'accès :
+# l'écran d'accueil s'affiche ainsi le plus vite possible.
+with st.spinner("Chargement…"):
+    try:
+        core = _charger_core()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Démarrage impossible : {e}")
+        st.stop()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def categories(url: str, token: str) -> list[str]:
     return cloud.get_categories(url, token)
@@ -106,6 +129,7 @@ if "message" in st.session_state:
     st.success(st.session_state.pop("message"))
 n = st.session_state.setdefault("n", 0)      # change après chaque envoi : remet les widgets à zéro
 
+st.caption(f"Version 3 · {pathlib.Path(core.__file__).name}")
 auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
 
 mode = st.radio("Comment ajouter la facture ?",
@@ -182,13 +206,15 @@ if not auteur.strip():
     st.caption("Indiquez votre prénom pour pouvoir envoyer.")
 
 if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
-    photo, photo_type = core.prepare_justificatif(data, name, preview)
     try:
+        photo, photo_type = core.prepare_justificatif(data, name, preview)
         res = cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur.strip(), date_facture=date_in.isoformat(),
                               categorie=cat, montant=amount_in, source=f"mobile:{name}", entry_id=entry_id,
                               photo=photo, photo_type=photo_type)
     except cloud.CloudError as e:
         st.error(f"Envoi impossible : {e}")
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Envoi impossible ({type(e).__name__}) : {e}")
     else:
         msg = f"✅ Envoyé : {eur(amount_in)} · {cat} · {MOIS[date_in.month - 1]}. Merci !"
         if res.get("photo_erreur"):
