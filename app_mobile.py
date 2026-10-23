@@ -111,14 +111,19 @@ def categories(url: str, token: str) -> list[str]:
 
 
 @st.cache_data(show_spinner="Lecture de la facture…")
-def analyse(raw: bytes, filename: str, enhance: bool):
+def analyse(raw: bytes, filename: str, recadrer: bool):
     preview, text, images = core.load_document(raw, filename)
-    if enhance and images:
-        images = [core.scan_document(i) for i in images]
+    qualite = core.image_quality(images[0]) if images else None
+    if recadrer and images:
+        images = [core.scan_document(i) for i in images]      # découpe la feuille, redresse, uniformise l'éclairage
         preview = images[0]
     if text is None:
-        text = core.run_ocr(images, "Tesseract")
-    return preview, text
+        lecture = core.read_invoice(images, "Tesseract")
+        text, amount, candidates = lecture["text"], lecture["amount"], lecture["candidates"]
+    else:
+        amount, candidates = core.find_amount(text)
+    return {"preview": preview, "text": text, "amount": amount, "candidates": candidates,
+            "floue": bool(qualite and qualite["floue"])}
 
 
 # ───────────────────────────── Page ─────────────────────────────
@@ -134,15 +139,15 @@ auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
 
 mode = st.radio("Comment ajouter la facture ?",
                 ["📷 Prendre une photo", "🧾 Scanner un document", "📎 Joindre un fichier"])
-data, name, enhance = None, "", False
+recadrer = st.checkbox("Recadrer automatiquement la feuille (conseillé)", value=True)
+data, name = None, ""
 if mode.startswith("📷"):
     st.caption("Si la caméra avant s'ouvre, choisissez plutôt « Joindre un fichier » puis « Prendre une photo ».")
     shot = st.camera_input("Cadrez la facture (bien à plat, bien éclairée)", key=f"cam_{n}")
     if shot:
         data, name = shot.getvalue(), "photo.jpg"
 elif mode.startswith("🧾"):
-    enhance = True
-    st.caption("La feuille est détectée, redressée et passée en noir et blanc contrasté.")
+    st.caption("La feuille est détectée, découpée et redressée.")
     up = st.file_uploader("Photo ou PDF du document", type=["png", "jpg", "jpeg", "pdf"], key=f"scan_{n}")
     if up:
         data, name = up.getvalue(), up.name
@@ -156,7 +161,8 @@ if data is None:
     st.stop()
 
 try:
-    preview, text = analyse(data, name, enhance)
+    info = analyse(data, name, recadrer)
+    preview, text = info["preview"], info["text"]
 except core.OcrUnavailable as e:
     st.error(f"Lecture impossible : {e}")
     st.stop()
@@ -176,7 +182,7 @@ if not cats:
 
 fh = hashlib.md5(data).hexdigest()[:10]
 entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)   # même id si on touche deux fois « Envoyer »
-amount, candidates = core.find_amount(text)
+amount, candidates = info["amount"], info["candidates"]
 date = core.find_date(text)
 
 st.image(preview, caption="Document analysé")
@@ -184,6 +190,8 @@ with st.expander("Texte lu par la machine"):
     st.text(text or "(aucun texte)")
 
 st.markdown("**Vérifiez et corrigez si besoin**")
+if info["floue"]:
+    st.warning("La photo est floue ou trop petite : la lecture automatique risque de se tromper. Rapprochez-vous de la facture, laissez le téléphone faire la mise au point, évitez les ombres, puis reprenez la photo.")
 if amount is None:
     st.warning("Montant non détecté : saisissez-le.")
 if date is None:

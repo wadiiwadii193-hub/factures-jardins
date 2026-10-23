@@ -392,72 +392,192 @@ def _order_points(pts):
     return rect
 
 
-def scan_document(img: Image.Image) -> Image.Image:
+def _page_quad(bgr):
     """
-    « Numérisation » façon appli de scan : détecte la feuille, redresse la perspective,
-    puis applique un seuillage adaptatif (fond blanc, texte noir).
-    Si aucune feuille n'est détectée, seule l'amélioration du contraste est appliquée.
+    Les 4 coins de la feuille, ou None. Le papier est clair et peu coloré, alors que la table, le bois
+    ou le tissu autour sont plus sombres ou plus colorés : on isole le papier par sa couleur,
+    ce qui marche beaucoup mieux que la recherche de contours sur un fond texturé.
     """
     import cv2
     import numpy as np
 
-    bgr = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
     h, w = bgr.shape[:2]
-    ratio = h / 800.0
-    small = cv2.resize(bgr, (max(1, int(w / ratio)), 800))
-    gray = cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-    edges = cv2.dilate(cv2.Canny(gray, 50, 150), None, iterations=1)
-    cnts, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-    page = None
-    for c in sorted(cnts, key=cv2.contourArea, reverse=True)[:5]:
-        approx = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True)
-        if len(approx) == 4 and cv2.contourArea(c) > 0.2 * small.shape[0] * small.shape[1]:
-            page = approx.reshape(4, 2).astype("float32") * ratio
+    k = min(1.0, 900.0 / max(h, w))
+    small = cv2.resize(bgr, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else bgr.copy()
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    v = cv2.GaussianBlur(hsv[:, :, 2], (0, 0), 4)
+    sat = cv2.GaussianBlur(hsv[:, :, 1], (0, 0), 4)
+    seuil, _ = cv2.threshold(v, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = ((v > seuil * 0.9) & (sat < 95)).astype(np.uint8) * 255
+    taille = max(5, int(0.03 * max(small.shape[:2])) | 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((taille, taille), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((taille // 2 | 1, taille // 2 | 1), np.uint8))
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    grand = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(grand) < 0.20 * small.shape[0] * small.shape[1]:
+        return None
+    hull = cv2.convexHull(grand)
+    peri = cv2.arcLength(hull, True)
+    quad = None
+    for eps in (0.01, 0.02, 0.03, 0.05, 0.08):
+        approx = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(approx) == 4:
+            quad = approx.reshape(4, 2).astype("float32")
             break
+    if quad is None:
+        quad = cv2.boxPoints(cv2.minAreaRect(hull)).astype("float32")
+    return quad / k
 
+
+def scan_document(img: Image.Image) -> Image.Image:
+    """
+    « Numérisation » : détecte la feuille, la découpe, redresse la perspective, puis uniformise l'éclairage
+    (fond blanc, texte net) SANS tout passer en noir et blanc brutal : le texte fin reste lisible.
+    Si la feuille n'est pas trouvée, l'image entière est conservée (éclairage uniformisé seulement).
+    """
+    import cv2
+    import numpy as np
+
+    bgr = cv2.cvtColor(np.array(ImageOps.exif_transpose(img).convert("RGB")), cv2.COLOR_RGB2BGR)
+    page = _page_quad(bgr)
     if page is not None:
         tl, tr, br, bl = _order_points(page)
         wd = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
         ht = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
-        dst = np.array([[0, 0], [wd - 1, 0], [wd - 1, ht - 1], [0, ht - 1]], dtype="float32")
-        M = cv2.getPerspectiveTransform(np.array([tl, tr, br, bl], dtype="float32"), dst)
-        bgr = cv2.warpPerspective(bgr, M, (wd, ht))
+        if wd > 200 and ht > 200:
+            ech = min(1.0, 3000.0 / max(wd, ht))
+            wd, ht = int(wd * ech), int(ht * ech)
+            dst = np.array([[0, 0], [wd - 1, 0], [wd - 1, ht - 1], [0, ht - 1]], dtype="float32")
+            M = cv2.getPerspectiveTransform(np.array([tl, tr, br, bl], dtype="float32"), dst)
+            bgr = cv2.warpPerspective(bgr, M, (wd, ht), flags=cv2.INTER_CUBIC)
+            marge = max(2, int(0.006 * max(wd, ht)))          # petite marge : retire le bord sombre résiduel
+            bgr = bgr[marge:-marge, marge:-marge]
 
-    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
-    return Image.fromarray(bw).convert("RGB")
+    gris = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    # éclairage uniformisé : on divise par le fond estimé (ombres, dégradés) puis on étire le contraste
+    h, w = gris.shape
+    petit = cv2.resize(gris, None, fx=0.25, fy=0.25, interpolation=cv2.INTER_AREA)
+    k = max(3, (min(petit.shape) // 12) | 1)
+    fond = cv2.resize(cv2.medianBlur(petit, k), (w, h), interpolation=cv2.INTER_LINEAR)
+    norm_ = cv2.divide(gris, np.maximum(fond, 1), scale=255)
+    bas, haut = np.percentile(norm_, (1, 97))
+    norm_ = np.clip((norm_.astype("float32") - bas) * 255.0 / max(haut - bas, 1.0), 0, 255).astype("uint8")
+    return Image.fromarray(norm_).convert("RGB")
+
+
+def image_quality(img: Image.Image) -> dict:
+    """Netteté et taille de la photo : permet de prévenir « photo floue » avant de lire la facture."""
+    import cv2
+    import numpy as np
+
+    g = cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    h, w = g.shape
+    k = 1000.0 / max(h, w)
+    g2 = cv2.resize(g, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
+    nettete = float(cv2.Laplacian(g2, cv2.CV_64F).var())
+    return {"largeur": w, "hauteur": h, "nettete": round(nettete, 1),
+            "floue": nettete < SEUIL_NETTETE or max(w, h) < 1000}
+
+
+SEUIL_NETTETE = 150.0
 
 
 def preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    """Niveaux de gris, agrandi vers ~2400 px sur le grand côté (le texte fin devient lisible pour l'OCR)."""
     img = ImageOps.exif_transpose(img).convert("L")
     w, h = img.size
     longest = max(w, h)
-    if longest < 1600:
-        k = 1600 / longest
+    cible = 2400
+    if longest < cible:
+        k = min(cible / longest, 3.0)
         img = img.resize((int(w * k), int(h * k)), Image.LANCZOS)
     elif longest > 3500:
         k = 3500 / longest
         img = img.resize((int(w * k), int(h * k)), Image.LANCZOS)
-    return ImageOps.autocontrast(img)
+    return ImageOps.autocontrast(img, cutoff=1)
 
 
-def ocr_tesseract(img: Image.Image) -> str:
+def _tesseract():
     try:
         import pytesseract
     except ImportError as e:
         raise OcrUnavailable("Installez pytesseract : pip install pytesseract") from e
     if os.environ.get("TESSERACT_CMD"):
         pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
+    return pytesseract
+
+
+def ocr_tesseract(img: Image.Image, psm: int = 6) -> str:
+    pytesseract = _tesseract()
     img = preprocess_for_ocr(img)
     try:
         try:
-            return pytesseract.image_to_string(img, lang="fra+eng", config="--psm 6")
+            return pytesseract.image_to_string(img, lang="fra+eng", config=f"--psm {psm}")
         except pytesseract.TesseractError:      # pack de langue français absent
-            return pytesseract.image_to_string(img, lang="eng", config="--psm 6")
+            return pytesseract.image_to_string(img, lang="eng", config=f"--psm {psm}")
     except pytesseract.TesseractNotFoundError as e:
         raise OcrUnavailable("Le programme Tesseract n'est pas installé (ou pas dans le PATH). "
                              "Voir les instructions d'installation.") from e
+
+
+def find_total_in_image(img: Image.Image):
+    """
+    Montant « Net à payer / Total TTC » repéré par sa POSITION : à droite du libellé, ou juste en dessous
+    (cas des tableaux où le libellé est en en-tête de colonne). Retourne un float ou None.
+    """
+    pytesseract = _tesseract()
+    prepared = preprocess_for_ocr(img)
+    try:
+        d = pytesseract.image_to_data(prepared, lang="fra+eng", config="--psm 6",
+                                      output_type=pytesseract.Output.DICT)
+    except Exception:  # noqa: BLE001
+        return None
+    mots = []
+    for i, t in enumerate(d["text"]):
+        t = t.strip()
+        if not t:
+            continue
+        mots.append({"t": t, "n": norm(t), "x": d["left"][i], "y": d["top"][i], "w": d["width"][i], "h": d["height"][i]})
+    for m in mots:
+        m["cx"], m["cy"], m["x2"] = m["x"] + m["w"] / 2, m["y"] + m["h"] / 2, m["x"] + m["w"]
+    montants = []
+    for m in mots:
+        t = m["t"].replace("€", "").replace("EUR", "").strip()
+        mt = _AMOUNT.fullmatch(t)
+        if mt and 0 < _to_float(mt) < 100_000:
+            montants.append((m, _to_float(mt)))
+    meilleurs = []                                           # (priorité, distance, montant)
+    for k in (m for m in mots if m["n"].startswith("ttc")):
+        ligne = sorted((m for m in mots if abs(m["cy"] - k["cy"]) < 0.6 * k["h"]), key=lambda m: m["x"])
+        i = ligne.index(k)
+        gauche, droite = i, i
+        sep = re.compile(r"^[\W_]+$")               # tirets, barres... : séparent les colonnes d'un en-tête
+        # un libellé = des mots serrés les uns contre les autres ; un espace large ou un tiret = autre colonne
+        while (gauche > 0 and ligne[gauche]["x"] - ligne[gauche - 1]["x2"] < 1.1 * k["h"]
+               and not sep.match(ligne[gauche - 1]["t"])):
+            gauche -= 1
+        while (droite < len(ligne) - 1 and ligne[droite + 1]["x"] - ligne[droite]["x2"] < 1.1 * k["h"]
+               and not sep.match(ligne[droite + 1]["t"])):
+            droite += 1
+        libelle = norm(" ".join(m["t"] for m in ligne[gauche:droite + 1]))
+        payer = bool(re.search(r"payer", libelle))                       # « net à payer », « total à payer »...
+        if not (payer or re.search(r"total|montant|net", libelle)):
+            continue
+        prio = 0 if payer else 1
+        x0, x1 = ligne[gauche]["x"], ligne[droite]["x2"]
+        marge = 0.25 * (x1 - x0)
+        for m, valeur in montants:
+            if abs(m["cy"] - k["cy"]) < 0.6 * k["h"] and m["x"] >= x1 - 0.5 * k["h"] and m["x"] - x1 < 20 * k["h"]:
+                meilleurs.append((prio, 0, m["x"] - x1, valeur))                  # même ligne, à droite
+            elif payer and 0.5 * k["h"] < m["cy"] - k["cy"] < 12 * k["h"] and x0 - marge <= m["cx"] <= x1 + marge:
+                # juste sous « Net à payer TTC » (libellé en en-tête de colonne). On ne le fait que pour « payer » :
+                # « Total TTC » en tête d'un tableau d'articles est suivi des prix de chaque ligne, pas du total.
+                meilleurs.append((prio, 1, m["cy"] - k["cy"], valeur))
+    if not meilleurs:
+        return None
+    return sorted(meilleurs)[0][3]
 
 
 _EASY = None
@@ -476,9 +596,33 @@ def ocr_easyocr(img: Image.Image) -> str:
     return "\n".join(_EASY.readtext(arr, detail=0, paragraph=False))
 
 
-def run_ocr(images, engine: str = "Tesseract") -> str:
-    fn = ocr_easyocr if engine.lower().startswith("easy") else ocr_tesseract
-    return "\n".join(fn(im) for im in images)
+def run_ocr(images, engine: str = "Tesseract", psm: int = 6) -> str:
+    if engine.lower().startswith("easy"):
+        return "\n".join(ocr_easyocr(im) for im in images)
+    return "\n".join(ocr_tesseract(im, psm) for im in images)
+
+
+def read_invoice(images, engine: str = "Tesseract") -> dict:
+    """
+    Lit la facture : texte, montant TTC le plus fiable et montants candidats.
+    Passe 1 : lecture normale. Passe 2 (si aucun montant) : autre découpage de la page.
+    Le montant repéré par sa position (sous/à côté de « Net à payer TTC ») prime sur l'analyse du texte.
+    """
+    texte = run_ocr(images, engine)
+    meilleur, candidats = find_amount(texte)
+    total = None
+    if not engine.lower().startswith("easy"):
+        for im in images:
+            total = find_total_in_image(im)
+            if total:
+                break
+        if meilleur is None and total is None:
+            texte += "\n" + run_ocr(images, engine, psm=4)
+            meilleur, candidats = find_amount(texte)
+    if total:
+        meilleur = total
+        candidats = [total] + [c for c in candidats if c != total]
+    return {"text": texte, "amount": meilleur, "candidates": candidats[:6]}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -516,8 +660,10 @@ def find_amount(text: str):
     for i, line in enumerate(lines):
         found = [_to_float(m) for m in _AMOUNT.finditer(line)]
         every += found
-        w = _line_weight(norm(line))
-        if w and not found and i + 1 < len(lines):          # montant sur la ligne suivante
+        n_ligne = norm(line)
+        w = _line_weight(n_ligne)
+        entete = bool(re.search(r"\b(ht|tva)\b", n_ligne))          # en-tête de colonnes : la ligne suivante n'est pas fiable
+        if w and not found and i + 1 < len(lines) and not entete:     # montant sur la ligne suivante
             found = [_to_float(m) for m in _AMOUNT.finditer(lines[i + 1])]
         weighted += [(w, a) for a in found if w]
     every = [a for a in every if 0 < a < 100_000]
