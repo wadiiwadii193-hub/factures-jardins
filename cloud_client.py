@@ -86,6 +86,20 @@ def list_all(url: str, token: str) -> list[dict]:
     return _call(url, token, "list_all", method="GET")["rows"]
 
 
+def list_validated(url: str, token: str) -> list[dict]:
+    """Factures validées depuis le téléphone du trésorier, en attente d'être ajoutées à Excel."""
+    return _call(url, token, "list_validated", method="GET")["rows"]
+
+
+def validate(url: str, token: str, items) -> int:
+    """items : liste de {id, categorie?, date_facture?, montant?} → statut « validée »."""
+    return int(_call(url, token, "validate", {"items": list(items)}).get("updated", 0))
+
+
+def reject(url: str, token: str, ids) -> int:
+    return int(_call(url, token, "reject", {"ids": list(ids)}).get("updated", 0))
+
+
 def mark_applied(url: str, token: str, ids) -> int:
     return int(_call(url, token, "mark_applied", {"ids": list(ids)}).get("updated", 0))
 

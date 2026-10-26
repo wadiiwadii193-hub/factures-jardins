@@ -431,7 +431,49 @@ def _page_quad(bgr):
     return quad / k
 
 
-def scan_document(img: Image.Image) -> Image.Image:
+def _text_mask(bgr):
+    """
+    Pixels de texte imprimé (sombres par rapport à leur voisinage), débarrassés des petites taches :
+    sert à vérifier qu'une découpe ne coupe aucun texte, et à découper autour du contenu.
+    Retourne (masque, échelle).
+    """
+    import cv2
+    import numpy as np
+
+    h, w = bgr.shape[:2]
+    k = min(1.0, 1000.0 / max(h, w))
+    small = cv2.resize(bgr, None, fx=k, fy=k, interpolation=cv2.INTER_AREA) if k < 1 else bgr
+    g = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    fond = cv2.medianBlur(g, 31)
+    T = (cv2.subtract(fond, g) > 25).astype(np.uint8) * 255
+    s = max(3, int(0.015 * max(g.shape)) | 1)
+    fusion = cv2.dilate(T, cv2.getStructuringElement(cv2.MORPH_RECT, (s * 3, s)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(fusion)
+    garde = np.zeros_like(T)
+    if n > 1:
+        # on garde les blocs de texte importants ; les petits motifs (broderie, rayures du support) sont ignorés
+        plus_grand = int(stats[1:, cv2.CC_STAT_AREA].max())
+        seuil = max(0.002 * g.shape[0] * g.shape[1], 0.08 * plus_grand)
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] >= seuil:
+                garde[labels == i] = 255
+    return cv2.bitwise_and(T, garde), k
+
+
+def _couverture(T, quad_petit):
+    """Part du texte qui se trouve à l'intérieur de la découpe (1.0 = rien n'est coupé)."""
+    import cv2
+    import numpy as np
+
+    total = int((T > 0).sum())
+    if total == 0:
+        return 1.0
+    masque = np.zeros_like(T)
+    cv2.fillConvexPoly(masque, quad_petit.astype("int32"), 255)
+    return float(((T > 0) & (masque > 0)).sum()) / total
+
+
+def scan_document(img: Image.Image, decouper: bool = True) -> Image.Image:
     """
     « Numérisation » : détecte la feuille, la découpe, redresse la perspective, puis uniformise l'éclairage
     (fond blanc, texte net) SANS tout passer en noir et blanc brutal : le texte fin reste lisible.
@@ -441,7 +483,19 @@ def scan_document(img: Image.Image) -> Image.Image:
     import numpy as np
 
     bgr = cv2.cvtColor(np.array(ImageOps.exif_transpose(img).convert("RGB")), cv2.COLOR_RGB2BGR)
-    page = _page_quad(bgr)
+    H0, W0 = bgr.shape[:2]
+    T, kt = _text_mask(bgr)
+    page = _page_quad(bgr) if decouper else None
+    if page is not None and T.any() and _couverture(T, page * kt) < 0.97:
+        page = None                       # la découpe « par la couleur » couperait du texte : on l'abandonne
+    if decouper and page is None and T.any():
+        # secours : on découpe autour du CONTENU imprimé (marge de 2 %), sans jamais couper de texte
+        x, y, wd, ht = cv2.boundingRect(cv2.findNonZero(T))
+        m = 0.02 * max(wd, ht)
+        x0, y0 = max(0, (x - m) / kt), max(0, (y - m) / kt)
+        x1, y1 = min(W0, (x + wd + m) / kt), min(H0, (y + ht + m) / kt)
+        if (x1 - x0) * (y1 - y0) < 0.92 * W0 * H0:
+            page = np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], dtype="float32")
     if page is not None:
         tl, tr, br, bl = _order_points(page)
         wd = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
@@ -619,6 +673,9 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
         if meilleur is None and total is None:
             texte += "\n" + run_ocr(images, engine, psm=4)
             meilleur, candidats = find_amount(texte)
+    somme = _total_par_somme([float(m.group(0).replace(",", ".")) for m in re.finditer(r"\d+[.,]\d{2}", texte)])
+    if total and somme and total != somme[0] and total in somme[1]:
+        total = somme[0]                    # ex. 3,88 (TVA) repéré à tort : 19,42 + 3,88 = 23,30
     if total:
         meilleur = total
         candidats = [total] + [c for c in candidats if c != total]
@@ -653,6 +710,21 @@ def _line_weight(n: str) -> int:
     return 0
 
 
+def _total_par_somme(valeurs):
+    """
+    Cherche un montant égal à la somme de deux autres (HT + TVA = TTC, ou somme des lignes).
+    Retourne (total, (a, b)) pour le plus grand total trouvé, ou None.
+    """
+    vals = sorted(round(v, 2) for v in valeurs if 0 < v < 100_000)
+    meilleur = None
+    for i, a in enumerate(vals):
+        for b in vals[i + 1:]:
+            c = round(a + b, 2)
+            if c > b and c in vals and (meilleur is None or c > meilleur[0]):
+                meilleur = (c, (a, b))
+    return meilleur
+
+
 def find_amount(text: str):
     """Retourne (meilleur montant TTC ou None, liste des montants candidats)."""
     lines = text.splitlines()
@@ -669,7 +741,11 @@ def find_amount(text: str):
     every = [a for a in every if 0 < a < 100_000]
     weighted = [(w, a) for w, a in weighted if 0 < a < 100_000]
 
-    best = max(weighted)[1] if weighted else (max(every) if every else None)
+    if weighted:
+        best = max(weighted)[1]
+    else:
+        somme = _total_par_somme(every)
+        best = somme[0] if somme else (max(every) if every else None)
     cands = []
     for a in ([best] if best else []) + [a for _, a in sorted(weighted, reverse=True)] + sorted(every, reverse=True):
         if a not in cands:
@@ -754,3 +830,22 @@ def prepare_justificatif(data: bytes, filename: str, preview: Image.Image, max_p
     out = io.BytesIO()
     img.save(out, "JPEG", quality=80, optimize=True)
     return out.getvalue(), "image/jpeg"
+
+
+def excel_verrouille(path) -> bool:
+    """
+    Vrai si le fichier semble ouvert dans Excel (Windows interdit alors d'y écrire) :
+    fichier verrou « ~$nom.xlsx » présent, ou écriture refusée par le système.
+    """
+    p = Path(path)
+    for nom in ("~$" + p.name, "~$" + p.name[2:]):
+        if (p.parent / nom).exists():
+            return True
+    try:
+        with open(p, "ab"):
+            pass
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return False

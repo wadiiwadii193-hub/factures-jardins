@@ -4,7 +4,9 @@ app_mobile.py — saisie d'une facture depuis un téléphone (envoi vers le Goog
 Hébergée en ligne (Streamlit Community Cloud). Réglages dans les « Secrets » de l'application :
     SCRIPT_URL  = "https://script.google.com/macros/s/.../exec"
     TOKEN       = "le même code secret que dans le script Google"
-    ACCESS_CODE = "le code d'accès à donner aux collègues"
+    CODES       = "Wadii=code-de-wadii; Walid=code-de-walid; Karim=code-de-karim"   (un code personnel par personne)
+    TRESORIER   = "Wadii"      (la personne qui peut valider les factures depuis son téléphone)
+    ACCESS_CODE = "un code unique pour tout le monde"   (ancien réglage, utilisé seulement si CODES est vide)
 """
 from __future__ import annotations
 
@@ -80,15 +82,49 @@ if not SCRIPT_URL or not TOKEN:
     st.error("Application non configurée : SCRIPT_URL et TOKEN manquent dans les réglages.")
     st.stop()
 
+
+def lire_codes(texte: str) -> dict:
+    """« Wadii=abc; Walid=def » → {"Wadii": "abc", "Walid": "def"} (séparateurs : « ; » ou retour à la ligne)."""
+    codes = {}
+    for morceau in texte.replace("\n", ";").split(";"):
+        if "=" in morceau:
+            nom, code = (x.strip() for x in morceau.split("=", 1))
+            if nom and code:
+                codes[nom] = code
+    return codes
+
+
+CODES = lire_codes(setting("CODES"))
+TRESORIER = setting("TRESORIER") or (next(iter(CODES)) if CODES else "")
+
+
+def identifier(code: str):
+    """(accepté ?, prénom ou None). Chaque collègue a son code : son prénom est alors connu sans le saisir."""
+    code = code.strip()
+    if not code:
+        return False, None
+    trouve = None
+    for nom, c in CODES.items():                      # on parcourt tout : même temps de réponse quel que soit le code
+        if hmac.compare_digest(code.encode(), c.encode()):
+            trouve = nom
+    if trouve:
+        return True, trouve
+    if ACCESS_CODE and hmac.compare_digest(code.encode(), ACCESS_CODE.encode()):
+        return True, None
+    return False, None
+
+
 # ───────────────────────────── Code d'accès ─────────────────────────────
-if ACCESS_CODE and not st.session_state.get("autorise"):
+if (CODES or ACCESS_CODE) and not st.session_state.get("autorise"):
     st.title("🌱 Jardins familiaux")
     with st.form("connexion"):
         code = st.text_input("Code d'accès", type="password")
         entrer = st.form_submit_button("Entrer", type="primary")
     if entrer:
-        if hmac.compare_digest(code.encode(), ACCESS_CODE.encode()):
+        accepte, prenom = identifier(code)
+        if accepte:
             st.session_state["autorise"] = True
+            st.session_state["utilisateur"] = prenom
             st.rerun()
         else:
             st.error("Code incorrect.")
@@ -114,8 +150,9 @@ def categories(url: str, token: str) -> list[str]:
 def analyse(raw: bytes, filename: str, recadrer: bool):
     preview, text, images = core.load_document(raw, filename)
     qualite = core.image_quality(images[0]) if images else None
-    if recadrer and images:
-        images = [core.scan_document(i) for i in images]      # découpe la feuille, redresse, uniformise l'éclairage
+    if images:
+        # l'éclairage est toujours uniformisé (indispensable à la lecture) ; la découpe suit la case « Recadrer »
+        images = [core.scan_document(i, decouper=recadrer) for i in images]
         preview = images[0]
     if text is None:
         lecture = core.read_invoice(images, "Tesseract")
@@ -126,16 +163,84 @@ def analyse(raw: bytes, filename: str, recadrer: bool):
             "floue": bool(qualite and qualite["floue"])}
 
 
-# ───────────────────────────── Page ─────────────────────────────
-st.title("🧾 Nouvelle facture")
-st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")
+def factures_recues():
+    """Écran du trésorier : voir les factures reçues, les corriger, les valider ou les rejeter."""
+    import pandas as pd
 
+    st.subheader("Factures reçues")
+    try:
+        cats = categories(SCRIPT_URL, TOKEN)
+        recues = cloud.list_pending(SCRIPT_URL, TOKEN)
+        validees = cloud.list_validated(SCRIPT_URL, TOKEN)
+    except cloud.CloudError as e:
+        st.error(str(e))
+        return
+    if validees:
+        st.info(f"✅ {len(validees)} facture(s) validée(s) : elles s'ajouteront au tableau Excel "
+                "dès que vous ouvrirez l'application sur votre PC.")
+    st.button("🔄 Actualiser")
+    if not recues:
+        st.success("Aucune facture en attente.")
+        return
+    tout = st.checkbox("Tout sélectionner")
+    lignes, vues = [], set()
+    for r in recues:
+        cle = (r["date_facture"], r["auteur"].lower(), r["categorie"].lower(), round(float(r["montant"]), 2))
+        doublon = cle in vues
+        vues.add(cle)
+        lignes.append({"Valider": tout and not doublon, "Date": dt.date.fromisoformat(r["date_facture"]),
+                       "Auteur": r["auteur"], "Catégorie": r["categorie"], "Montant (€)": float(r["montant"]),
+                       "Photo": r.get("photo_url") or None,
+                       "Remarque": "Doublon possible" if doublon else "", "id": r["id"]})
+    options = list(cats) + sorted({x["Catégorie"] for x in lignes if x["Catégorie"] not in cats})
+    edite = st.data_editor(
+        pd.DataFrame(lignes), hide_index=True, key=f"recues_{tout}", disabled=["Auteur", "Photo", "Remarque"],
+        column_config={"id": None,
+                       "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY", required=True),
+                       "Catégorie": st.column_config.SelectboxColumn("Catégorie", options=options, required=True),
+                       "Montant (€)": st.column_config.NumberColumn(format="%.2f", min_value=0.01),
+                       "Photo": st.column_config.LinkColumn("Photo", display_text="Ouvrir")})
+    cochees = edite[edite["Valider"]]
+    st.caption("Touchez une date, une catégorie ou un montant pour le corriger, cochez les lignes, puis validez.")
+    gauche, droite = st.columns(2)
+    if gauche.button("✅ Valider", type="primary", disabled=cochees.empty):
+        items = [{"id": r["id"], "categorie": r["Catégorie"], "montant": float(r["Montant (€)"]),
+                  "date_facture": pd.Timestamp(r["Date"]).date().isoformat()} for _, r in cochees.iterrows()]
+        try:
+            nb = cloud.validate(SCRIPT_URL, TOKEN, items)
+        except cloud.CloudError as e:
+            st.error(f"Validation impossible : {e}")
+        else:
+            st.session_state["message"] = (f"✅ {nb} facture(s) validée(s). Elles seront ajoutées au tableau "
+                                           "à l'ouverture de l'application sur le PC.")
+            st.rerun()
+    if droite.button("🗑️ Rejeter", disabled=cochees.empty):
+        try:
+            nb = cloud.reject(SCRIPT_URL, TOKEN, list(cochees["id"]))
+        except cloud.CloudError as e:
+            st.error(f"Rejet impossible : {e}")
+        else:
+            st.session_state["message"] = f"🗑️ {nb} facture(s) rejetée(s)."
+            st.rerun()
+
+
+# ───────────────────────────── Page ─────────────────────────────
+utilisateur = st.session_state.get("utilisateur")
+est_tresorier = bool(utilisateur) and utilisateur.lower() == TRESORIER.lower()
+st.caption(f"Version 4 · {pathlib.Path(core.__file__).name}" + (f" · connecté : {utilisateur}" if utilisateur else ""))
 if "message" in st.session_state:
     st.success(st.session_state.pop("message"))
+if est_tresorier:
+    vue = st.radio("Que voulez-vous faire ?", ["🧾 Envoyer une facture", "📥 Factures reçues"], horizontal=True)
+    if vue.startswith("📥"):
+        factures_recues()
+        st.stop()
+
+st.title("🧾 Nouvelle facture")
+st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")
 n = st.session_state.setdefault("n", 0)      # change après chaque envoi : remet les widgets à zéro
 
-st.caption(f"Version 3 · {pathlib.Path(core.__file__).name}")
-auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
+auteur = utilisateur or st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
 
 mode = st.radio("Comment ajouter la facture ?",
                 ["📷 Prendre une photo", "🧾 Scanner un document", "📎 Joindre un fichier"])
