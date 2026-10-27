@@ -4,9 +4,8 @@ app_mobile.py — saisie d'une facture depuis un téléphone (envoi vers le Goog
 Hébergée en ligne (Streamlit Community Cloud). Réglages dans les « Secrets » de l'application :
     SCRIPT_URL  = "https://script.google.com/macros/s/.../exec"
     TOKEN       = "le même code secret que dans le script Google"
-    CODES       = "Wadii=code-de-wadii; Walid=code-de-walid; Karim=code-de-karim"   (un code personnel par personne)
-    TRESORIER   = "Wadii"      (la personne qui peut valider les factures depuis son téléphone)
-    ACCESS_CODE = "un code unique pour tout le monde"   (ancien réglage, utilisé seulement si CODES est vide)
+    ACCESS_CODE    = "le code d'accès donné aux collègues"   (ils saisissent aussi leur prénom)
+    TRESORIER_CODE = "le code du trésorier"   (donne en plus l'écran « Factures reçues » : valider / rejeter)
 """
 from __future__ import annotations
 
@@ -83,48 +82,30 @@ if not SCRIPT_URL or not TOKEN:
     st.stop()
 
 
-def lire_codes(texte: str) -> dict:
-    """« Wadii=abc; Walid=def » → {"Wadii": "abc", "Walid": "def"} (séparateurs : « ; » ou retour à la ligne)."""
-    codes = {}
-    for morceau in texte.replace("\n", ";").split(";"):
-        if "=" in morceau:
-            nom, code = (x.strip() for x in morceau.split("=", 1))
-            if nom and code:
-                codes[nom] = code
-    return codes
-
-
-CODES = lire_codes(setting("CODES"))
-TRESORIER = setting("TRESORIER") or (next(iter(CODES)) if CODES else "")
+TRESORIER_CODE = setting("TRESORIER_CODE")
 
 
 def identifier(code: str):
-    """(accepté ?, prénom ou None). Chaque collègue a son code : son prénom est alors connu sans le saisir."""
+    """(accepté ?, trésorier ?) : le code des collègues donne l'envoi de factures, celui du trésorier donne aussi la validation."""
     code = code.strip()
     if not code:
-        return False, None
-    trouve = None
-    for nom, c in CODES.items():                      # on parcourt tout : même temps de réponse quel que soit le code
-        if hmac.compare_digest(code.encode(), c.encode()):
-            trouve = nom
-    if trouve:
-        return True, trouve
-    if ACCESS_CODE and hmac.compare_digest(code.encode(), ACCESS_CODE.encode()):
-        return True, None
-    return False, None
+        return False, False
+    est_tresorier = bool(TRESORIER_CODE) and hmac.compare_digest(code.encode(), TRESORIER_CODE.encode())
+    est_collegue = bool(ACCESS_CODE) and hmac.compare_digest(code.encode(), ACCESS_CODE.encode())
+    return est_tresorier or est_collegue, est_tresorier
 
 
 # ───────────────────────────── Code d'accès ─────────────────────────────
-if (CODES or ACCESS_CODE) and not st.session_state.get("autorise"):
+if (ACCESS_CODE or TRESORIER_CODE) and not st.session_state.get("autorise"):
     st.title("🌱 Jardins familiaux")
     with st.form("connexion"):
         code = st.text_input("Code d'accès", type="password")
         entrer = st.form_submit_button("Entrer", type="primary")
     if entrer:
-        accepte, prenom = identifier(code)
+        accepte, tresorier = identifier(code)
         if accepte:
             st.session_state["autorise"] = True
-            st.session_state["utilisateur"] = prenom
+            st.session_state["tresorier"] = tresorier
             st.rerun()
         else:
             st.error("Code incorrect.")
@@ -225,9 +206,8 @@ def factures_recues():
 
 
 # ───────────────────────────── Page ─────────────────────────────
-utilisateur = st.session_state.get("utilisateur")
-est_tresorier = bool(utilisateur) and utilisateur.lower() == TRESORIER.lower()
-st.caption(f"Version 4 · {pathlib.Path(core.__file__).name}" + (f" · connecté : {utilisateur}" if utilisateur else ""))
+est_tresorier = bool(st.session_state.get("tresorier"))
+st.caption(f"Version 4 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if "message" in st.session_state:
     st.success(st.session_state.pop("message"))
 if est_tresorier:
@@ -240,7 +220,7 @@ st.title("🧾 Nouvelle facture")
 st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")
 n = st.session_state.setdefault("n", 0)      # change après chaque envoi : remet les widgets à zéro
 
-auteur = utilisateur or st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
+auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
 
 mode = st.radio("Comment ajouter la facture ?",
                 ["📷 Prendre une photo", "🧾 Scanner un document", "📎 Joindre un fichier"])
