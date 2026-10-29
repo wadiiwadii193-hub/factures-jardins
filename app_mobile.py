@@ -9,16 +9,20 @@ Hébergée en ligne (Streamlit Community Cloud). Réglages dans les « Secrets �
 """
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import hashlib
 import hmac
 import importlib.util
 import pathlib
 import sys
+import tempfile
+import time
 import unicodedata
 import uuid
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import cloud_client as cloud
 
@@ -76,6 +80,96 @@ def eur(x: float) -> str:
     return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " €"
 
 
+# ── Prise de photo stable sur Android : l'appareil photo du téléphone s'ouvre directement, et la photo est
+#    RÉDUITE dans le téléphone (1800 px, JPEG) avant l'envoi : peu de mémoire, envoi rapide, pas de blocage.
+CAPTURE_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body{margin:0;font-family:sans-serif}
+ #btn{display:block;box-sizing:border-box;width:100%;padding:18px;font-size:18px;border-radius:10px;
+      background:#ff4b4b;color:#fff;text-align:center;cursor:pointer}
+ #info{margin-top:8px;font-size:14px;color:#444;text-align:center}
+ #apercu{display:none;max-width:100%;max-height:150px;margin:8px auto 0;border-radius:6px}
+</style></head><body>
+<label id="btn" for="f">📷 Prendre la photo</label>
+<input id="f" type="file" accept="image/*" capture="environment" style="display:none">
+<div id="info"></div><img id="apercu" alt="">
+<script>
+(function () {
+  var MAX = 1800, QUALITE = 0.85;
+  var f = document.getElementById("f"), info = document.getElementById("info"), ap = document.getElementById("apercu");
+  function envoyer(type, extra) { window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, extra || {}), "*"); }
+  function hauteur() { envoyer("streamlit:setFrameHeight", {height: document.documentElement.scrollHeight + 6}); }
+  envoyer("streamlit:componentReady", {apiVersion: 1});
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "streamlit:render") {
+      var a = e.data.args || {};
+      if (a.libelle) { document.getElementById("btn").textContent = a.libelle; }
+      hauteur();
+    }
+  });
+  function taille(w, h) { var k = Math.min(1, MAX / Math.max(w, h)); return [Math.round(w * k), Math.round(h * k)]; }
+  function versJpeg(source, w, h) {
+    var t = taille(w, h), c = document.createElement("canvas");
+    c.width = t[0]; c.height = t[1];
+    c.getContext("2d").drawImage(source, 0, 0, t[0], t[1]);
+    return new Promise(function (ok, ko) {
+      c.toBlob(function (b) { c.width = 0; c.height = 0; if (b) { ok([b, t[0], t[1]]); } else { ko(new Error("toBlob")); } },
+               "image/jpeg", QUALITE);
+    });
+  }
+  function viaImage(file) {
+    return new Promise(function (ok, ko) {
+      var u = URL.createObjectURL(file), im = new Image();
+      im.onload = function () { URL.revokeObjectURL(u); versJpeg(im, im.naturalWidth, im.naturalHeight).then(ok, ko); };
+      im.onerror = function () { URL.revokeObjectURL(u); ko(new Error("image")); };
+      im.src = u;
+    });
+  }
+  function viaBitmap(file) {
+    return createImageBitmap(file, {imageOrientation: "from-image"}).then(function (bmp) {
+      return versJpeg(bmp, bmp.width, bmp.height).then(function (r) { if (bmp.close) { bmp.close(); } return r; });
+    });
+  }
+  function finir(blob, w, h) {
+    var lecteur = new FileReader();
+    lecteur.onload = function () {
+      var data = String(lecteur.result).split(",")[1];
+      ap.src = URL.createObjectURL(blob); ap.style.display = "block";
+      info.textContent = "✅ Photo prête (" + Math.round(blob.size / 1024) + " Ko)";
+      hauteur();
+      envoyer("streamlit:setComponentValue", {value: {data: data, w: w, h: h, t: Date.now()}, dataType: "json"});
+    };
+    lecteur.onerror = function () { info.textContent = "❌ Lecture impossible : reprenez la photo."; hauteur(); };
+    lecteur.readAsDataURL(blob);
+  }
+  f.addEventListener("change", function () {
+    var file = f.files && f.files[0];
+    if (!file) { return; }
+    info.textContent = "⏳ Préparation de la photo…"; ap.style.display = "none"; hauteur();
+    var p = window.createImageBitmap ? viaBitmap(file).catch(function () { return viaImage(file); }) : viaImage(file);
+    p.then(function (r) { finir(r[0], r[1], r[2]); })
+     .catch(function () { info.textContent = "❌ Photo illisible : reprenez-la."; hauteur(); })
+     .then(function () { f.value = ""; });
+  });
+  hauteur();
+})();
+</script></body></html>"""
+
+_dossier_capture = pathlib.Path(tempfile.gettempdir()) / "composant_capture_photo_v1"
+_dossier_capture.mkdir(parents=True, exist_ok=True)
+(_dossier_capture / "index.html").write_text(CAPTURE_HTML, encoding="utf-8")
+capture_photo = components.declare_component("capture_photo", path=str(_dossier_capture))
+
+
+def photo_du_telephone(cle: str, libelle: str):
+    """Octets JPEG de la photo prise (déjà réduite par le téléphone), ou None."""
+    valeur = capture_photo(libelle=libelle, key=cle, default=None)
+    if valeur and valeur.get("data"):
+        return base64.b64decode(valeur["data"])
+    return None
+
+
 SCRIPT_URL, TOKEN, ACCESS_CODE = setting("SCRIPT_URL"), setting("TOKEN"), setting("ACCESS_CODE")
 if not SCRIPT_URL or not TOKEN:
     st.error("Application non configurée : SCRIPT_URL et TOKEN manquent dans les réglages.")
@@ -83,6 +177,52 @@ if not SCRIPT_URL or not TOKEN:
 
 
 TRESORIER_CODE = setting("TRESORIER_CODE")
+
+# Écran affiché après « Fermer »
+if st.session_state.get("ferme"):
+    st.title("🌱 Jardins familiaux")
+    st.success("Session fermée. Vous pouvez fermer cet onglet.")
+    if st.button("Se reconnecter"):
+        st.session_state.clear()
+        st.rerun()
+    st.stop()
+
+
+def _signature(role: str, expire: int) -> str:
+    return hmac.new(TOKEN.encode(), f"{role}|{expire}".encode(), "sha256").hexdigest()[:20]
+
+
+def _jeton(role: str) -> str:
+    expire = int(time.time()) + 6 * 3600                 # reste valable 6 h
+    return f"{role}.{expire}.{_signature(role, expire)}"
+
+
+def _role_du_jeton(jeton: str):
+    """« c » (collègue) ou « t » (trésorier) si le jeton de l'adresse est valide, sinon None."""
+    try:
+        role, expire, signature = jeton.split(".")
+        if role in ("c", "t") and int(expire) > time.time() and hmac.compare_digest(signature, _signature(role, int(expire))):
+            return role
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def fermer_session():
+    """Réinitialise tout : session, mémoire des lectures, adresse (jeton de reconnexion)."""
+    st.session_state.clear()
+    st.cache_data.clear()
+    st.query_params.clear()
+    st.session_state["ferme"] = True
+    st.rerun()
+
+
+# Si Android a recyclé l'onglet pendant la prise de photo, la page se recharge : on reconnecte sans redemander le code
+if not st.session_state.get("autorise") and st.query_params.get("acces"):
+    _role = _role_du_jeton(st.query_params.get("acces"))
+    if _role:
+        st.session_state["autorise"] = True
+        st.session_state["tresorier"] = _role == "t"
 
 
 def identifier(code: str):
@@ -106,6 +246,7 @@ if (ACCESS_CODE or TRESORIER_CODE) and not st.session_state.get("autorise"):
         if accepte:
             st.session_state["autorise"] = True
             st.session_state["tresorier"] = tresorier
+            st.query_params["acces"] = _jeton("t" if tresorier else "c")
             st.rerun()
         else:
             st.error("Code incorrect.")
@@ -127,7 +268,7 @@ def categories(url: str, token: str) -> list[str]:
     return cloud.get_categories(url, token)
 
 
-@st.cache_data(show_spinner="Lecture de la facture…")
+@st.cache_data(show_spinner="Lecture de la facture…", max_entries=2, ttl=900)
 def analyse(raw: bytes, filename: str, recadrer: bool):
     preview, text, images = core.load_document(raw, filename)
     qualite = core.image_quality(images[0]) if images else None
@@ -207,7 +348,10 @@ def factures_recues():
 
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
-st.caption(f"Version 4 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche, _droite = st.columns([3, 1])
+_gauche.caption(f"Version 5 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+if _droite.button("🚪 Fermer", key="fermer"):
+    fermer_session()
 if "message" in st.session_state:
     st.success(st.session_state.pop("message"))
 if est_tresorier:
@@ -220,22 +364,23 @@ st.title("🧾 Nouvelle facture")
 st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")
 n = st.session_state.setdefault("n", 0)      # change après chaque envoi : remet les widgets à zéro
 
+st.session_state.setdefault("auteur", st.query_params.get("p", ""))
 auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
+if auteur.strip() and st.query_params.get("p") != auteur.strip():
+    st.query_params["p"] = auteur.strip()
 
 mode = st.radio("Comment ajouter la facture ?",
                 ["📷 Prendre une photo", "🧾 Scanner un document", "📎 Joindre un fichier"])
 recadrer = st.checkbox("Recadrer automatiquement la feuille (conseillé)", value=True)
 data, name = None, ""
 if mode.startswith("📷"):
-    st.caption("Si la caméra avant s'ouvre, choisissez plutôt « Joindre un fichier » puis « Prendre une photo ».")
-    shot = st.camera_input("Cadrez la facture (bien à plat, bien éclairée)", key=f"cam_{n}")
-    if shot:
-        data, name = shot.getvalue(), "photo.jpg"
+    st.caption("Facture bien à plat, bien éclairée, en entier dans l'image.")
+    data = photo_du_telephone(f"photo_{n}", "📷 Prendre la photo")
+    name = "photo.jpg"
 elif mode.startswith("🧾"):
     st.caption("La feuille est détectée, découpée et redressée.")
-    up = st.file_uploader("Photo ou PDF du document", type=["png", "jpg", "jpeg", "pdf"], key=f"scan_{n}")
-    if up:
-        data, name = up.getvalue(), up.name
+    data = photo_du_telephone(f"scan_{n}", "🧾 Scanner la feuille")
+    name = "scan.jpg"
 else:
     up = st.file_uploader("Photo, image (PNG/JPG) ou PDF", type=["png", "jpg", "jpeg", "pdf"], key=f"file_{n}")
     if up:

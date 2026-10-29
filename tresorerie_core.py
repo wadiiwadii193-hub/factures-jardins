@@ -354,6 +354,9 @@ def log_operation(path, **fields):
 # ════════════════════════════════════════════════════════════════════════════
 #  4. IMAGES : chargement, numérisation, OCR
 # ════════════════════════════════════════════════════════════════════════════
+MAX_COTE = 2600       # plus grand côté conservé (en pixels) : une photo de 12 Mpx ne sature plus la mémoire
+
+
 def load_document(data: bytes, filename: str = "", max_pages: int = 5):
     """
     Retourne (aperçu PIL, texte intégré au PDF ou None, [images à OCRiser]).
@@ -361,7 +364,13 @@ def load_document(data: bytes, filename: str = "", max_pages: int = 5):
     """
     is_pdf = filename.lower().endswith(".pdf") or data[:5] == b"%PDF-"
     if not is_pdf:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        img = Image.open(io.BytesIO(data))
+        try:
+            img.draft("RGB", (MAX_COTE, MAX_COTE))        # JPEG : décodage directement à taille réduite (peu de mémoire)
+        except Exception:  # noqa: BLE001
+            pass
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        img.thumbnail((MAX_COTE, MAX_COTE), Image.LANCZOS)
         return img, None, [img]
 
     try:
@@ -379,7 +388,7 @@ def load_document(data: bytes, filename: str = "", max_pages: int = 5):
     text = "\n".join(p.get_text("text") for p in pages).strip()
     if len(text) >= 40:                       # PDF avec couche texte
         return render(pages[0], 110), text, []
-    images = [render(p, 250) for p in pages]  # PDF scanné → OCR
+    images = [render(p, 200) for p in pages]  # PDF scanné → OCR
     return images[0], None, images
 
 
