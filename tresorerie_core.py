@@ -552,7 +552,7 @@ def preprocess_for_ocr(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("L")
     w, h = img.size
     longest = max(w, h)
-    cible = 2400
+    cible = 2000
     if longest < cible:
         k = min(cible / longest, 3.0)
         img = img.resize((int(w * k), int(h * k)), Image.LANCZOS)
@@ -585,24 +585,47 @@ def ocr_tesseract(img: Image.Image, psm: int = 6) -> str:
                              "Voir les instructions d'installation.") from e
 
 
+def ocr_donnees(img: Image.Image, psm: int = 6):
+    """Une seule lecture Tesseract : le texte (ligne par ligne) ET la position de chaque mot."""
+    pytesseract = _tesseract()
+    prepared = preprocess_for_ocr(img)
+    try:
+        try:
+            d = pytesseract.image_to_data(prepared, lang="fra+eng", config=f"--psm {psm}",
+                                          output_type=pytesseract.Output.DICT)
+        except pytesseract.TesseractError:          # pack de langue français absent
+            d = pytesseract.image_to_data(prepared, lang="eng", config=f"--psm {psm}",
+                                          output_type=pytesseract.Output.DICT)
+    except pytesseract.TesseractNotFoundError as e:
+        raise OcrUnavailable("Le programme Tesseract n'est pas installé (ou pas dans le PATH). "
+                             "Voir les instructions d'installation.") from e
+    mots, lignes = [], {}
+    for k, t in enumerate(d["text"]):
+        t = (t or "").strip()
+        if not t:
+            continue
+        mots.append({"t": t, "n": norm(t), "x": d["left"][k], "y": d["top"][k], "w": d["width"][k], "h": d["height"][k]})
+        lignes.setdefault((d["block_num"][k], d["par_num"][k], d["line_num"][k]), []).append(t)
+    texte = "\n".join(" ".join(v) for _, v in sorted(lignes.items()))
+    return texte, mots
+
+
 def find_total_in_image(img: Image.Image):
+    """Montant « Net à payer / Total TTC » repéré par sa position (voir find_total_in_words)."""
+    try:
+        _, mots = ocr_donnees(img)
+    except OcrUnavailable:
+        raise
+    except Exception:  # noqa: BLE001
+        return None
+    return find_total_in_words(mots)
+
+
+def find_total_in_words(mots):
     """
     Montant « Net à payer / Total TTC » repéré par sa POSITION : à droite du libellé, ou juste en dessous
     (cas des tableaux où le libellé est en en-tête de colonne). Retourne un float ou None.
     """
-    pytesseract = _tesseract()
-    prepared = preprocess_for_ocr(img)
-    try:
-        d = pytesseract.image_to_data(prepared, lang="fra+eng", config="--psm 6",
-                                      output_type=pytesseract.Output.DICT)
-    except Exception:  # noqa: BLE001
-        return None
-    mots = []
-    for i, t in enumerate(d["text"]):
-        t = t.strip()
-        if not t:
-            continue
-        mots.append({"t": t, "n": norm(t), "x": d["left"][i], "y": d["top"][i], "w": d["width"][i], "h": d["height"][i]})
     for m in mots:
         m["cx"], m["cy"], m["x2"] = m["x"] + m["w"] / 2, m["y"] + m["h"] / 2, m["x"] + m["w"]
     montants = []
@@ -668,20 +691,27 @@ def run_ocr(images, engine: str = "Tesseract", psm: int = 6) -> str:
 def read_invoice(images, engine: str = "Tesseract") -> dict:
     """
     Lit la facture : texte, montant TTC le plus fiable et montants candidats.
-    Passe 1 : lecture normale. Passe 2 (si aucun montant) : autre découpage de la page.
-    Le montant repéré par sa position (sous/à côté de « Net à payer TTC ») prime sur l'analyse du texte.
+    Une seule lecture par image (texte + positions). Le montant repéré par sa position
+    (à côté ou sous « Net à payer TTC ») prime sur l'analyse du texte.
     """
-    texte = run_ocr(images, engine)
-    meilleur, candidats = find_amount(texte)
+    import time
+
+    debut = time.time()
     total = None
-    if not engine.lower().startswith("easy"):
+    if engine.lower().startswith("easy"):
+        texte = run_ocr(images, engine)
+    else:
+        morceaux = []
         for im in images:
-            total = find_total_in_image(im)
-            if total:
-                break
-        if meilleur is None and total is None:
-            texte += "\n" + run_ocr(images, engine, psm=4)
-            meilleur, candidats = find_amount(texte)
+            t_im, mots = ocr_donnees(im)
+            morceaux.append(t_im)
+            if total is None:
+                total = find_total_in_words(mots)
+        texte = "\n".join(morceaux)
+    meilleur, candidats = find_amount(texte)
+    if meilleur is None and total is None and not engine.lower().startswith("easy") and time.time() - debut < 15:
+        texte += "\n" + run_ocr(images, engine, psm=4)          # 2e passe seulement si la 1re a été rapide
+        meilleur, candidats = find_amount(texte)
     somme = _total_par_somme([float(m.group(0).replace(",", ".")) for m in re.finditer(r"\d+[.,]\d{2}", texte)])
     if total and somme and total != somme[0] and total in somme[1]:
         total = somme[0]                    # ex. 3,88 (TVA) repéré à tort : 19,42 + 3,88 = 23,30
@@ -858,3 +888,12 @@ def excel_verrouille(path) -> bool:
     except OSError:
         return False
     return False
+
+
+def maintenant_fr() -> dt.datetime:
+    """Date et heure actuelles à Paris (le serveur en ligne est à l'heure UTC)."""
+    try:
+        from zoneinfo import ZoneInfo
+        return dt.datetime.now(ZoneInfo("Europe/Paris"))
+    except Exception:  # noqa: BLE001  (pas de base de fuseaux : on prend l'heure de l'appareil)
+        return dt.datetime.now()

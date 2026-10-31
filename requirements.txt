@@ -7,5 +7,6 @@ opencv-python-headless>=4.9
 pytesseract>=0.3.10
 pymupdf>=1.24
 requests>=2.31
+tzdata
 # Optionnel (lourd, ~2 Go avec PyTorch) : moteur OCR alternatif
 # easyocr
