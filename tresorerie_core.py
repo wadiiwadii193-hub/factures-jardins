@@ -21,8 +21,6 @@ from copy import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import openpyxl
-import pandas as pd
 from PIL import Image, ImageOps
 
 MOIS_FR = ["janvier", "février", "mars", "avril", "mai", "juin", "juillet",
@@ -147,6 +145,8 @@ def detect_layout(ws) -> Layout:
 
 def valid_sheets(path) -> list[str]:
     """Feuilles dont la structure est reconnue."""
+    import openpyxl
+
     wb = openpyxl.load_workbook(path)
     out = []
     for ws in wb.worksheets:
@@ -215,6 +215,8 @@ class Model:
 
 
 def _block_frame(ws, lay: Layout, block: Block, headers: list[str]) -> pd.DataFrame:
+    import pandas as pd
+
     cols = _data_cols(ws, lay)
     labels, data = [], []
     for r in block.rows():
@@ -229,6 +231,9 @@ def _block_frame(ws, lay: Layout, block: Block, headers: list[str]) -> pd.DataFr
 
 
 def open_model(path, sheet: str) -> Model:
+    import openpyxl
+    import pandas as pd
+
     wb = openpyxl.load_workbook(path)
     ws = wb[sheet]
     lay = detect_layout(ws)
@@ -304,6 +309,8 @@ def record_amount(path, sheet: str, which: str, month: int, amount: float, *,
         raise ValueError("Mois invalide.")
     if amount is None or amount <= 0:
         raise ValueError("Le montant doit être strictement positif.")
+
+    import openpyxl
 
     wb = openpyxl.load_workbook(path)          # formules conservées
     ws = wb[sheet]
@@ -552,12 +559,12 @@ def preprocess_for_ocr(img: Image.Image) -> Image.Image:
     img = ImageOps.exif_transpose(img).convert("L")
     w, h = img.size
     longest = max(w, h)
-    cible = 2000
+    cible = 1800
     if longest < cible:
         k = min(cible / longest, 3.0)
         img = img.resize((int(w * k), int(h * k)), Image.LANCZOS)
-    elif longest > 3500:
-        k = 3500 / longest
+    elif longest > 2600:
+        k = 2600 / longest
         img = img.resize((int(w * k), int(h * k)), Image.LANCZOS)
     return ImageOps.autocontrast(img, cutoff=1)
 
@@ -567,6 +574,7 @@ def _tesseract():
         import pytesseract
     except ImportError as e:
         raise OcrUnavailable("Installez pytesseract : pip install pytesseract") from e
+    os.environ.setdefault("OMP_THREAD_LIMIT", "1")      # sur un petit serveur, plusieurs threads ralentissent Tesseract
     if os.environ.get("TESSERACT_CMD"):
         pytesseract.pytesseract.tesseract_cmd = os.environ["TESSERACT_CMD"]
     return pytesseract
@@ -577,9 +585,9 @@ def ocr_tesseract(img: Image.Image, psm: int = 6) -> str:
     img = preprocess_for_ocr(img)
     try:
         try:
-            return pytesseract.image_to_string(img, lang="fra+eng", config=f"--psm {psm}")
+            return pytesseract.image_to_string(img, lang="fra+eng", config=f"--psm {psm}", timeout=25)
         except pytesseract.TesseractError:      # pack de langue français absent
-            return pytesseract.image_to_string(img, lang="eng", config=f"--psm {psm}")
+            return pytesseract.image_to_string(img, lang="eng", config=f"--psm {psm}", timeout=25)
     except pytesseract.TesseractNotFoundError as e:
         raise OcrUnavailable("Le programme Tesseract n'est pas installé (ou pas dans le PATH). "
                              "Voir les instructions d'installation.") from e
@@ -592,10 +600,10 @@ def ocr_donnees(img: Image.Image, psm: int = 6):
     try:
         try:
             d = pytesseract.image_to_data(prepared, lang="fra+eng", config=f"--psm {psm}",
-                                          output_type=pytesseract.Output.DICT)
+                                          output_type=pytesseract.Output.DICT, timeout=25)
         except pytesseract.TesseractError:          # pack de langue français absent
             d = pytesseract.image_to_data(prepared, lang="eng", config=f"--psm {psm}",
-                                          output_type=pytesseract.Output.DICT)
+                                          output_type=pytesseract.Output.DICT, timeout=25)
     except pytesseract.TesseractNotFoundError as e:
         raise OcrUnavailable("Le programme Tesseract n'est pas installé (ou pas dans le PATH). "
                              "Voir les instructions d'installation.") from e

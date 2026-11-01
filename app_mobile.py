@@ -14,6 +14,7 @@ import datetime as dt
 import hashlib
 import hmac
 import importlib.util
+import io
 import pathlib
 import sys
 import tempfile
@@ -110,9 +111,24 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       } else {
         f.setAttribute("capture", "environment"); f.setAttribute("accept", "image/*");       // appareil photo arrière
       }
+      if (a.effacer) { try { localStorage.removeItem("photo_en_cours"); } catch (e) {} }
+      if (a.restaurer && !a.effacer && !restaure) { restaure = true; retrouver(); }
       hauteur();
     }
   });
+  var restaure = false;
+  function garder(v) {
+    try { if (v.data.length < 3500000) { localStorage.setItem("photo_en_cours", JSON.stringify({t: Date.now(), v: v})); } } catch (e) {}
+  }
+  function retrouver() {
+    try {
+      var s = JSON.parse(localStorage.getItem("photo_en_cours") || "null");
+      if (s && s.v && Date.now() - s.t < 900000) {
+        info.textContent = "✅ Photo retrouvée après le rechargement de la page"; hauteur();
+        envoyer("streamlit:setComponentValue", {value: s.v, dataType: "json"});
+      }
+    } catch (e) {}
+  }
   function taille(w, h) { var k = Math.min(1, MAX / Math.max(w, h)); return [Math.round(w * k), Math.round(h * k)]; }
   function versJpeg(source, w, h) {
     var t = taille(w, h), c = document.createElement("canvas");
@@ -143,7 +159,9 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       ap.src = URL.createObjectURL(blob); ap.style.display = "block";
       info.textContent = "✅ Photo prête (" + Math.round(blob.size / 1024) + " Ko)";
       hauteur();
-      envoyer("streamlit:setComponentValue", {value: {data: data, w: w, h: h, nom: "photo.jpg", type: "image/jpeg", t: Date.now()}, dataType: "json"});
+      var v = {data: data, w: w, h: h, nom: "photo.jpg", type: "image/jpeg", t: Date.now()};
+      garder(v);
+      envoyer("streamlit:setComponentValue", {value: v, dataType: "json"});
     };
     lecteur.onerror = function () { info.textContent = "❌ Lecture impossible : reprenez la photo."; hauteur(); };
     lecteur.readAsDataURL(blob);
@@ -157,7 +175,9 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       var lp = new FileReader();
       lp.onload = function () {
         info.textContent = "✅ Document prêt (" + Math.round(file.size / 1024) + " Ko)"; hauteur();
-        envoyer("streamlit:setComponentValue", {value: {data: String(lp.result).split(",")[1], nom: file.name, type: "application/pdf", t: Date.now()}, dataType: "json"});
+        var v = {data: String(lp.result).split(",")[1], nom: file.name, type: "application/pdf", t: Date.now()};
+        garder(v);
+        envoyer("streamlit:setComponentValue", {value: v, dataType: "json"});
         f.value = "";
       };
       lp.onerror = function () { info.textContent = "❌ Lecture impossible : réessayez."; hauteur(); };
@@ -174,7 +194,7 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 })();
 </script></body></html>"""
 
-_dossier_capture = pathlib.Path(tempfile.gettempdir()) / "composant_capture_photo_v2"
+_dossier_capture = pathlib.Path(tempfile.gettempdir()) / "composant_capture_photo_v3"
 _dossier_capture.mkdir(parents=True, exist_ok=True)
 (_dossier_capture / "index.html").write_text(CAPTURE_HTML, encoding="utf-8")
 capture_photo = components.declare_component("capture_photo", path=str(_dossier_capture))
@@ -182,7 +202,8 @@ capture_photo = components.declare_component("capture_photo", path=str(_dossier_
 
 def photo_du_telephone(cle: str, libelle: str, mode: str = "photo"):
     """(octets, nom) de la photo ou du document choisi dans le téléphone (déjà réduit), ou (None, "")."""
-    valeur = capture_photo(libelle=libelle, mode=mode, key=cle, default=None)
+    valeur = capture_photo(libelle=libelle, mode=mode, restaurer=bool(st.session_state.get("reprise")),
+                           effacer=bool(st.session_state.pop("effacer_photo", False)), key=cle, default=None)
     if valeur and valeur.get("data"):
         st.session_state["recu_" + cle] = (base64.b64decode(valeur["data"]), valeur.get("nom") or "photo.jpg")
     return st.session_state.get("recu_" + cle, (None, ""))
@@ -239,6 +260,7 @@ def fermer_session():
 if not st.session_state.get("autorise") and st.query_params.get("acces"):
     _role = _role_du_jeton(st.query_params.get("acces"))
     if _role:
+        st.session_state["reprise"] = True            # la page a été rechargée : la photo en cours sera retrouvée
         st.session_state["autorise"] = True
         st.session_state["tresorier"] = _role == "t"
 
@@ -286,21 +308,39 @@ def categories(url: str, token: str) -> list[str]:
     return cloud.get_categories(url, token)
 
 
-@st.cache_data(show_spinner="Lecture de la facture…", max_entries=2, ttl=900)
-def analyse(raw: bytes, filename: str, recadrer: bool):
-    preview, text, images = core.load_document(raw, filename)
+def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
+    """Lecture automatique (montant, date, catégorie probable) + aperçu recadré. Peut être lente : jamais bloquante."""
+    preview, texte, images = core.load_document(raw, nom)
     qualite = core.image_quality(images[0]) if images else None
     if images:
-        # l'éclairage est toujours uniformisé (indispensable à la lecture) ; la découpe suit la case « Recadrer »
         images = [core.scan_document(i, decouper=recadrer) for i in images]
         preview = images[0]
-    if text is None:
+    if texte is None:
         lecture = core.read_invoice(images, "Tesseract")
-        text, amount, candidates = lecture["text"], lecture["amount"], lecture["candidates"]
+        texte, montant, candidats = lecture["text"], lecture["amount"], lecture["candidates"]
     else:
-        amount, candidates = core.find_amount(text)
-    return {"preview": preview, "text": text, "amount": amount, "candidates": candidates,
+        montant, candidats = core.find_amount(texte)
+    apercu = io.BytesIO()
+    vignette = preview.convert("RGB")
+    vignette.thumbnail((1600, 1600))
+    vignette.save(apercu, "JPEG", quality=80, optimize=True)
+    return {"amount": montant, "candidates": candidats, "date": core.find_date(texte), "text": texte,
+            "suggestion": core.suggest_category(texte, cats), "preview_jpeg": apercu.getvalue(),
             "floue": bool(qualite and qualite["floue"])}
+
+
+def photo_a_envoyer(raw: bytes, nom: str, lect: dict | None):
+    """(octets, type) de la pièce justificative conservée dans le Drive : PDF d'origine, ou image recadrée et légère."""
+    if nom.lower().endswith(".pdf") or raw[:5] == b"%PDF-":
+        return raw, "application/pdf"
+    if lect and lect.get("preview_jpeg"):
+        return lect["preview_jpeg"], "image/jpeg"
+    from PIL import Image
+    img = Image.open(io.BytesIO(raw))
+    img.thumbnail((1800, 1800))
+    sortie = io.BytesIO()
+    img.convert("RGB").save(sortie, "JPEG", quality=82, optimize=True)
+    return sortie.getvalue(), "image/jpeg"
 
 
 def factures_recues():
@@ -367,7 +407,7 @@ def factures_recues():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 6 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 7 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -382,10 +422,7 @@ st.title("🧾 Nouvelle facture")
 st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")
 n = st.session_state.setdefault("n", 0)      # change après chaque envoi : remet les widgets à zéro
 
-st.session_state.setdefault("auteur", st.query_params.get("p", ""))
 auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
-if auteur.strip() and st.query_params.get("p") != auteur.strip():
-    st.query_params["p"] = auteur.strip()
 
 mode = st.radio("Comment ajouter la facture ?",
                 ["📷 Prendre une photo", "🧾 Scanner un document", "📎 Joindre un fichier"])
@@ -409,21 +446,12 @@ if data is None and st.session_state.get(f"recu_classique_{n}"):
     data, name = st.session_state[f"recu_classique_{n}"]
 
 if data is None:
-    st.info("Ajoutez une facture pour lancer la lecture automatique.")
+    st.info("Ajoutez une facture : le formulaire s'affichera aussitôt.")
     st.stop()
 
-try:
-    info = analyse(data, name, recadrer)
-    preview, text = info["preview"], info["text"]
-except core.OcrUnavailable as e:
-    st.error(f"Lecture impossible : {e}")
-    st.stop()
-except Exception as e:  # noqa: BLE001
-    import traceback
-    st.error(f"Lecture impossible ({type(e).__name__}) : {e}")
-    with st.expander("Détail technique (à envoyer au trésorier)"):
-        st.code(traceback.format_exc()[-1500:])
-    st.stop()
+fh = hashlib.md5(data).hexdigest()[:10]
+entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)   # même id si on touche deux fois « Envoyer »
+st.success(f"📎 Document reçu ({max(1, len(data) // 1024)} Ko). Complétez le formulaire ci-dessous.")
 
 try:
     cats = categories(SCRIPT_URL, TOKEN)
@@ -435,31 +463,50 @@ if not cats:
                "ouvrir l'application sur son PC.")
     st.stop()
 
-fh = hashlib.md5(data).hexdigest()[:10]
-entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)   # même id si on touche deux fois « Envoyer »
-amount, candidates = info["amount"], info["candidates"]
-date = core.find_date(text)
+# Résultat de la lecture automatique (s'il existe déjà) : appliqué AVANT la création des champs
+cle_lect = f"lect_{fh}_{int(recadrer)}"
+lect = st.session_state.get(cle_lect)
+if lect and not st.session_state.get("init_" + cle_lect):
+    st.session_state["init_" + cle_lect] = True
+    if lect.get("amount") and not st.session_state.get(f"amt_{fh}"):
+        st.session_state[f"amt_{fh}"] = float(lect["amount"])
+    if st.session_state.get(f"cat_{fh}") is None:
+        if lect.get("date"):
+            st.session_state[f"date_{fh}"] = lect["date"]
+        if lect.get("suggestion") is not None and lect["suggestion"] < len(cats):
+            st.session_state[f"cat_{fh}"] = cats[lect["suggestion"]]
+st.session_state.setdefault(f"amt_{fh}", 0.0)
+st.session_state.setdefault(f"date_{fh}", dt.date.today())
 
-st.image(preview, caption="Document analysé")
-with st.expander("Texte lu par la machine"):
-    st.text(text or "(aucun texte)")
+if lect and lect.get("preview_jpeg"):
+    st.image(lect["preview_jpeg"], caption="Document recadré")
+elif name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
+    st.caption("📄 Document PDF reçu.")
+else:
+    st.image(data, caption="Document reçu")
 
 st.markdown("**Vérifiez et corrigez si besoin**")
-if info["floue"]:
-    st.warning("La photo est floue ou trop petite : la lecture automatique risque de se tromper. Rapprochez-vous de la facture, laissez le téléphone faire la mise au point, évitez les ombres, puis reprenez la photo.")
-if amount is None:
-    st.warning("Montant non détecté : saisissez-le.")
-if date is None:
-    st.warning("Date non détectée : choisissez-la.")
-if len(candidates) > 1:
-    st.caption("Autres montants lus : " + " · ".join(eur(c) for c in candidates if c != amount))
+if lect is None:
+    st.caption("⏳ Lecture automatique du montant et de la date en cours… Vous pouvez déjà remplir le formulaire.")
+elif lect.get("erreur"):
+    st.warning(f"Lecture automatique impossible ({lect['erreur']}). Saisissez le montant et la date à la main.")
+else:
+    if lect["floue"]:
+        st.warning("La photo est floue ou trop petite : la lecture automatique risque de se tromper. "
+                   "Rapprochez-vous de la facture, évitez les ombres, puis reprenez la photo.")
+    if lect["amount"] is None:
+        st.warning("Montant non détecté : saisissez-le.")
+    if lect["date"] is None:
+        st.warning("Date non détectée : choisissez-la.")
+    if len(lect["candidates"]) > 1:
+        st.caption("Autres montants lus : " + " · ".join(eur(c) for c in lect["candidates"] if c != lect["amount"]))
 
-amount_in = st.number_input("Montant TTC (€)", min_value=0.0, value=float(amount or 0.0),
-                            step=0.01, format="%.2f", key=f"amt_{fh}")
-date_in = st.date_input("Date de la facture", value=date or dt.date.today(),
-                        format="DD/MM/YYYY", key=f"date_{fh}")
-cat = st.selectbox("Catégorie", cats, index=core.suggest_category(text, cats),
-                   placeholder="Choisir une catégorie…", key=f"cat_{fh}")
+amount_in = st.number_input("Montant TTC (€)", min_value=0.0, step=0.01, format="%.2f", key=f"amt_{fh}")
+date_in = st.date_input("Date de la facture", format="DD/MM/YYYY", key=f"date_{fh}")
+if f"cat_{fh}" in st.session_state:
+    cat = st.selectbox("Catégorie", cats, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
+else:
+    cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
 
 if cat:
     st.info(f"➡️ **{cat}** · **{MOIS[date_in.month - 1]} {date_in.year}** · **{eur(amount_in)}**")
@@ -470,7 +517,7 @@ if not auteur.strip():
 
 if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
     try:
-        photo, photo_type = core.prepare_justificatif(data, name, preview)
+        photo, photo_type = photo_a_envoyer(data, name, lect)
         res = cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur.strip(), date_facture=date_in.isoformat(),
                               categorie=cat, montant=amount_in, source=f"mobile:{name}", entry_id=entry_id,
                               photo=photo, photo_type=photo_type)
@@ -486,4 +533,16 @@ if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
             msg += " (La facture est bien enregistrée, mais sa photo n'a pas pu être conservée.)"
         st.session_state["message"] = msg
         st.session_state["n"] = n + 1
+        st.session_state["effacer_photo"] = True         # la photo gardée dans le téléphone n'est plus utile
         st.rerun()
+
+# Lecture automatique : en DERNIER, une fois le formulaire affiché. Une erreur ou un dépassement de temps
+# n'empêche jamais d'envoyer la facture (on saisit alors le montant à la main).
+if lect is None:
+    try:
+        with st.spinner("Lecture automatique de la facture…"):
+            lect = lire_facture(data, name, recadrer, cats)
+    except Exception as e:  # noqa: BLE001
+        lect = {"erreur": f"{type(e).__name__}"}
+    st.session_state[cle_lect] = lect
+    st.rerun()
