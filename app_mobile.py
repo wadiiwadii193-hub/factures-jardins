@@ -402,8 +402,6 @@ def factures_recues():
         else:
             st.session_state["message"] = f"🗑️ {nb} facture(s) rejetée(s)."
             st.rerun()
-
-
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
@@ -420,7 +418,7 @@ if est_tresorier:
 
 st.title("🧾 Nouvelle facture")
 st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")
-n = st.session_state.setdefault("n", 0)      # change après chaque envoi : remet les widgets à zéro
+n = st.session_state.setdefault("n", 0)
 
 auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
 
@@ -450,7 +448,7 @@ if data is None:
     st.stop()
 
 fh = hashlib.md5(data).hexdigest()[:10]
-entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)   # même id si on touche deux fois « Envoyer »
+entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)
 st.success(f"📎 Document reçu ({max(1, len(data) // 1024)} Ko). Complétez le formulaire ci-dessous.")
 
 try:
@@ -459,54 +457,26 @@ except cloud.CloudError as e:
     st.error(str(e))
     st.stop()
 if not cats:
-    st.warning("La liste des catégories n'est pas encore disponible : le trésorier doit d'abord "
-               "ouvrir l'application sur son PC.")
+    st.warning("La liste des catégories n'est pas encore disponible : le trésorier doit d'abord ouvrir l'application sur son PC.")
     st.stop()
 
-# Résultat de la lecture automatique (s'il existe déjà) : appliqué AVANT la création des champs
-cle_lect = f"lect_{fh}_{int(recadrer)}"
-lect = st.session_state.get(cle_lect)
-if lect and not st.session_state.get("init_" + cle_lect):
-    st.session_state["init_" + cle_lect] = True
-    if lect.get("amount") and not st.session_state.get(f"amt_{fh}"):
-        st.session_state[f"amt_{fh}"] = float(lect["amount"])
-    if st.session_state.get(f"cat_{fh}") is None:
-        if lect.get("date"):
-            st.session_state[f"date_{fh}"] = lect["date"]
-        if lect.get("suggestion") is not None and lect["suggestion"] < len(cats):
-            st.session_state[f"cat_{fh}"] = cats[lect["suggestion"]]
-st.session_state.setdefault(f"amt_{fh}", 0.0)
-st.session_state.setdefault(f"date_{fh}", dt.date.today())
-
-if lect and lect.get("preview_jpeg"):
-    st.image(lect["preview_jpeg"], caption="Document recadré")
-elif name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
+# Gestion propre du justificatif reçu
+if name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
     st.caption("📄 Document PDF reçu.")
 else:
-    st.image(data, caption="Document reçu")
+    st.image(data, caption="Document reçu", use_column_width=True)
 
-st.markdown("**Vérifiez et corrigez si besoin**")
-if lect is None:
-    st.caption("⏳ Lecture automatique du montant et de la date en cours… Vous pouvez déjà remplir le formulaire.")
-elif lect.get("erreur"):
-    st.warning(f"Lecture automatique impossible ({lect['erreur']}). Saisissez le montant et la date à la main.")
-else:
-    if lect["floue"]:
-        st.warning("La photo est floue ou trop petite : la lecture automatique risque de se tromper. "
-                   "Rapprochez-vous de la facture, évitez les ombres, puis reprenez la photo.")
-    if lect["amount"] is None:
-        st.warning("Montant non détecté : saisissez-le.")
-    if lect["date"] is None:
-        st.warning("Date non détectée : choisissez-la.")
-    if len(lect["candidates"]) > 1:
-        st.caption("Autres montants lus : " + " · ".join(eur(c) for c in lect["candidates"] if c != lect["amount"]))
+st.markdown("**Saisissez les détails de la facture**")
+
+st.session_state.setdefault(f"amt_{fh}", 0.0)
+st.session_state.setdefault(f"date_{fh}", dt.date.today())
 
 amount_in = st.number_input("Montant TTC (€)", min_value=0.0, step=0.01, format="%.2f", key=f"amt_{fh}")
 date_in = st.date_input("Date de la facture", format="DD/MM/YYYY", key=f"date_{fh}")
 if f"cat_{fh}" in st.session_state:
     cat = st.selectbox("Catégorie", cats, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
 else:
-    cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
+    cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir me catégorie…", key=f"cat_{fh}")
 
 if cat:
     st.info(f"➡️ **{cat}** · **{MOIS[date_in.month - 1]} {date_in.year}** · **{eur(amount_in)}**")
@@ -517,13 +487,13 @@ if not auteur.strip():
 
 if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
     try:
-        photo, photo_type = photo_a_envoyer(data, name, lect)
+        photo, photo_type = photo_a_envoyer(data, name, None)
         res = cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur.strip(), date_facture=date_in.isoformat(),
                               categorie=cat, montant=amount_in, source=f"mobile:{name}", entry_id=entry_id,
                               photo=photo, photo_type=photo_type)
     except cloud.CloudError as e:
         st.error(f"Envoi impossible : {e}")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         st.error(f"Envoi impossible ({type(e).__name__}) : {e}")
     else:
         envoye = core.maintenant_fr()
@@ -533,16 +503,6 @@ if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
             msg += " (La facture est bien enregistrée, mais sa photo n'a pas pu être conservée.)"
         st.session_state["message"] = msg
         st.session_state["n"] = n + 1
-        st.session_state["effacer_photo"] = True         # la photo gardée dans le téléphone n'est plus utile
+        st.session_state["effacer_photo"] = True
         st.rerun()
 
-# Lecture automatique : en DERNIER, une fois le formulaire affiché. Une erreur ou un dépassement de temps
-# n'empêche jamais d'envoyer la facture (on saisit alors le montant à la main).
-if lect is None:
-    try:
-        with st.spinner("Lecture automatique de la facture…"):
-            lect = lire_facture(data, name, recadrer, cats)
-    except Exception as e:  # noqa: BLE001
-        lect = {"erreur": f"{type(e).__name__}"}
-    st.session_state[cle_lect] = lect
-    st.rerun()
