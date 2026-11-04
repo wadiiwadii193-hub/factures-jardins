@@ -97,7 +97,7 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <div id="info"></div><img id="apercu" alt="">
 <script>
 (function () {
-  var MAX = 1800, QUALITE = 0.85;
+  var MAX = 1400, QUALITE = 0.72;
   var f = document.getElementById("f"), info = document.getElementById("info"), ap = document.getElementById("apercu");
   function envoyer(type, extra) { window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, extra || {}), "*"); }
   function hauteur() { envoyer("streamlit:setFrameHeight", {height: document.documentElement.scrollHeight + 6}); }
@@ -106,6 +106,10 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     if (e.data && e.data.type === "streamlit:render") {
       var a = e.data.args || {};
       if (a.libelle) { document.getElementById("btn").textContent = a.libelle; }
+      if (a.recu) {
+        if (timer) { clearTimeout(timer); }
+        info.textContent = "✅ Reçue par l'application (" + a.taille + " Ko)";
+      }
       if (a.mode === "fichier") {
         f.removeAttribute("capture"); f.setAttribute("accept", "image/*,application/pdf");   // galerie, appareil photo ou PDF
       } else {
@@ -116,7 +120,7 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       hauteur();
     }
   });
-  var restaure = false;
+  var restaure = false, timer = null;
   function garder(v) {
     try { if (v.data.length < 3500000) { localStorage.setItem("photo_en_cours", JSON.stringify({t: Date.now(), v: v})); } } catch (e) {}
   }
@@ -162,6 +166,10 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       var v = {data: data, w: w, h: h, nom: "photo.jpg", type: "image/jpeg", t: Date.now()};
       garder(v);
       envoyer("streamlit:setComponentValue", {value: v, dataType: "json"});
+      timer = setTimeout(function () {
+        info.textContent = "⚠️ La photo n'est pas arrivée dans l'application (connexion lente ?). Utilisez « Envoi classique » ci-dessous.";
+        hauteur();
+      }, 8000);
     };
     lecteur.onerror = function () { info.textContent = "❌ Lecture impossible : reprenez la photo."; hauteur(); };
     lecteur.readAsDataURL(blob);
@@ -194,7 +202,7 @@ CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 })();
 </script></body></html>"""
 
-_dossier_capture = pathlib.Path(tempfile.gettempdir()) / "composant_capture_photo_v3"
+_dossier_capture = pathlib.Path(tempfile.gettempdir()) / "composant_capture_photo_v4"
 _dossier_capture.mkdir(parents=True, exist_ok=True)
 (_dossier_capture / "index.html").write_text(CAPTURE_HTML, encoding="utf-8")
 capture_photo = components.declare_component("capture_photo", path=str(_dossier_capture))
@@ -202,8 +210,10 @@ capture_photo = components.declare_component("capture_photo", path=str(_dossier_
 
 def photo_du_telephone(cle: str, libelle: str, mode: str = "photo"):
     """(octets, nom) de la photo ou du document choisi dans le téléphone (déjà réduit), ou (None, "")."""
+    deja = st.session_state.get("recu_" + cle)
     valeur = capture_photo(libelle=libelle, mode=mode, restaurer=bool(st.session_state.get("reprise")),
-                           effacer=bool(st.session_state.pop("effacer_photo", False)), key=cle, default=None)
+                           effacer=bool(st.session_state.pop("effacer_photo", False)),
+                           recu=bool(deja), taille=(len(deja[0]) // 1024 if deja else 0), key=cle, default=None)
     if valeur and valeur.get("data"):
         st.session_state["recu_" + cle] = (base64.b64decode(valeur["data"]), valeur.get("nom") or "photo.jpg")
     return st.session_state.get("recu_" + cle, (None, ""))
@@ -402,10 +412,12 @@ def factures_recues():
         else:
             st.session_state["message"] = f"🗑️ {nb} facture(s) rejetée(s)."
             st.rerun()
+
+
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 7 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 8 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -418,7 +430,7 @@ if est_tresorier:
 
 st.title("🧾 Nouvelle facture")
 st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")
-n = st.session_state.setdefault("n", 0)
+n = st.session_state.setdefault("n", 0)      # change après chaque envoi : remet les widgets à zéro
 
 auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
 
@@ -436,10 +448,12 @@ else:
     st.caption("Une photo de la galerie ou de l'appareil photo, ou un document PDF.")
     data, name = photo_du_telephone(f"fichier_{n}", "📎 Choisir une photo ou un document", "fichier")
 
-with st.expander("Ça ne fonctionne pas ? Envoi classique"):
-    classique = st.file_uploader("Photo ou PDF", type=["png", "jpg", "jpeg", "pdf"], key=f"classique_{n}")
-    if classique:
-        st.session_state[f"recu_classique_{n}"] = (classique.getvalue(), classique.name)
+types_classiques = ["pdf", "png", "jpg", "jpeg"] if mode.startswith("📎") else ["png", "jpg", "jpeg"]
+st.markdown("**Envoi classique** (si le bouton rouge ne fonctionne pas) :")
+classique = st.file_uploader("Choisir une photo" if not mode.startswith("📎") else "Choisir une photo ou un PDF",
+                             type=types_classiques, key=f"classique_{n}_{len(types_classiques)}")
+if classique:
+    st.session_state[f"recu_classique_{n}"] = (classique.getvalue(), classique.name)
 if data is None and st.session_state.get(f"recu_classique_{n}"):
     data, name = st.session_state[f"recu_classique_{n}"]
 
@@ -448,7 +462,7 @@ if data is None:
     st.stop()
 
 fh = hashlib.md5(data).hexdigest()[:10]
-entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)
+entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)   # même id si on touche deux fois « Envoyer »
 st.success(f"📎 Document reçu ({max(1, len(data) // 1024)} Ko). Complétez le formulaire ci-dessous.")
 
 try:
@@ -457,26 +471,54 @@ except cloud.CloudError as e:
     st.error(str(e))
     st.stop()
 if not cats:
-    st.warning("La liste des catégories n'est pas encore disponible : le trésorier doit d'abord ouvrir l'application sur son PC.")
+    st.warning("La liste des catégories n'est pas encore disponible : le trésorier doit d'abord "
+               "ouvrir l'application sur son PC.")
     st.stop()
 
-# Gestion propre du justificatif reçu
-if name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
-    st.caption("📄 Document PDF reçu.")
-else:
-    st.image(data, caption="Document reçu", use_column_width=True)
-
-st.markdown("**Saisissez les détails de la facture**")
-
+# Résultat de la lecture automatique (s'il existe déjà) : appliqué AVANT la création des champs
+cle_lect = f"lect_{fh}_{int(recadrer)}"
+lect = st.session_state.get(cle_lect)
+if lect and not st.session_state.get("init_" + cle_lect):
+    st.session_state["init_" + cle_lect] = True
+    if lect.get("amount") and not st.session_state.get(f"amt_{fh}"):
+        st.session_state[f"amt_{fh}"] = float(lect["amount"])
+    if st.session_state.get(f"cat_{fh}") is None:
+        if lect.get("date"):
+            st.session_state[f"date_{fh}"] = lect["date"]
+        if lect.get("suggestion") is not None and lect["suggestion"] < len(cats):
+            st.session_state[f"cat_{fh}"] = cats[lect["suggestion"]]
 st.session_state.setdefault(f"amt_{fh}", 0.0)
 st.session_state.setdefault(f"date_{fh}", dt.date.today())
+
+if lect and lect.get("preview_jpeg"):
+    st.image(lect["preview_jpeg"], caption="Document recadré")
+elif name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
+    st.caption("📄 Document PDF reçu.")
+else:
+    st.image(data, caption="Document reçu")
+
+st.markdown("**Vérifiez et corrigez si besoin**")
+if lect is None:
+    st.caption("⏳ Lecture automatique du montant et de la date en cours… Vous pouvez déjà remplir le formulaire.")
+elif lect.get("erreur"):
+    st.warning(f"Lecture automatique impossible ({lect['erreur']}). Saisissez le montant et la date à la main.")
+else:
+    if lect["floue"]:
+        st.warning("La photo est floue ou trop petite : la lecture automatique risque de se tromper. "
+                   "Rapprochez-vous de la facture, évitez les ombres, puis reprenez la photo.")
+    if lect["amount"] is None:
+        st.warning("Montant non détecté : saisissez-le.")
+    if lect["date"] is None:
+        st.warning("Date non détectée : choisissez-la.")
+    if len(lect["candidates"]) > 1:
+        st.caption("Autres montants lus : " + " · ".join(eur(c) for c in lect["candidates"] if c != lect["amount"]))
 
 amount_in = st.number_input("Montant TTC (€)", min_value=0.0, step=0.01, format="%.2f", key=f"amt_{fh}")
 date_in = st.date_input("Date de la facture", format="DD/MM/YYYY", key=f"date_{fh}")
 if f"cat_{fh}" in st.session_state:
     cat = st.selectbox("Catégorie", cats, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
 else:
-    cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir me catégorie…", key=f"cat_{fh}")
+    cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
 
 if cat:
     st.info(f"➡️ **{cat}** · **{MOIS[date_in.month - 1]} {date_in.year}** · **{eur(amount_in)}**")
@@ -487,13 +529,13 @@ if not auteur.strip():
 
 if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
     try:
-        photo, photo_type = photo_a_envoyer(data, name, None)
+        photo, photo_type = photo_a_envoyer(data, name, lect)
         res = cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur.strip(), date_facture=date_in.isoformat(),
                               categorie=cat, montant=amount_in, source=f"mobile:{name}", entry_id=entry_id,
                               photo=photo, photo_type=photo_type)
     except cloud.CloudError as e:
         st.error(f"Envoi impossible : {e}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         st.error(f"Envoi impossible ({type(e).__name__}) : {e}")
     else:
         envoye = core.maintenant_fr()
@@ -503,6 +545,16 @@ if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
             msg += " (La facture est bien enregistrée, mais sa photo n'a pas pu être conservée.)"
         st.session_state["message"] = msg
         st.session_state["n"] = n + 1
-        st.session_state["effacer_photo"] = True
+        st.session_state["effacer_photo"] = True         # la photo gardée dans le téléphone n'est plus utile
         st.rerun()
 
+# Lecture automatique : en DERNIER, une fois le formulaire affiché. Une erreur ou un dépassement de temps
+# n'empêche jamais d'envoyer la facture (on saisit alors le montant à la main).
+if lect is None:
+    try:
+        with st.spinner("Lecture automatique de la facture…"):
+            lect = lire_facture(data, name, recadrer, cats)
+    except Exception as e:  # noqa: BLE001
+        lect = {"erreur": f"{type(e).__name__}"}
+    st.session_state[cle_lect] = lect
+    st.rerun()
