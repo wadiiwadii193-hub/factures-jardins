@@ -23,7 +23,6 @@ import unicodedata
 import uuid
 
 import streamlit as st
-import streamlit.components.v1 as components
 
 import cloud_client as cloud
 
@@ -79,144 +78,6 @@ def setting(name: str) -> str:
 
 def eur(x: float) -> str:
     return f"{x:,.2f}".replace(",", " ").replace(".", ",") + " €"
-
-
-# ── Prise de photo stable sur Android : l'appareil photo du téléphone s'ouvre directement, et la photo est
-#    RÉDUITE dans le téléphone (1800 px, JPEG) avant l'envoi : peu de mémoire, envoi rapide, pas de blocage.
-CAPTURE_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
- body{margin:0;font-family:sans-serif}
- #btn{display:block;box-sizing:border-box;width:100%;padding:18px;font-size:18px;border-radius:10px;
-      background:#ff4b4b;color:#fff;text-align:center;cursor:pointer}
- #info{margin-top:8px;font-size:14px;color:#444;text-align:center}
- #apercu{display:none;max-width:100%;max-height:150px;margin:8px auto 0;border-radius:6px}
-</style></head><body>
-<label id="btn" for="f">📷 Prendre la photo</label>
-<input id="f" type="file" accept="image/*" capture="environment" style="display:none">
-<div id="info"></div><img id="apercu" alt="">
-<script>
-(function () {
-  var MAX = 1400, QUALITE = 0.72;
-  var f = document.getElementById("f"), info = document.getElementById("info"), ap = document.getElementById("apercu");
-  function envoyer(type, extra) { window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: type}, extra || {}), "*"); }
-  function hauteur() { envoyer("streamlit:setFrameHeight", {height: document.documentElement.scrollHeight + 6}); }
-  envoyer("streamlit:componentReady", {apiVersion: 1});
-  window.addEventListener("message", function (e) {
-    if (e.data && e.data.type === "streamlit:render") {
-      var a = e.data.args || {};
-      if (a.libelle) { document.getElementById("btn").textContent = a.libelle; }
-      if (a.recu) {
-        if (timer) { clearTimeout(timer); }
-        info.textContent = "✅ Reçue par l'application (" + a.taille + " Ko)";
-      }
-      if (a.mode === "fichier") {
-        f.removeAttribute("capture"); f.setAttribute("accept", "image/*,application/pdf");   // galerie, appareil photo ou PDF
-      } else {
-        f.setAttribute("capture", "environment"); f.setAttribute("accept", "image/*");       // appareil photo arrière
-      }
-      if (a.effacer) { try { localStorage.removeItem("photo_en_cours"); } catch (e) {} }
-      if (a.restaurer && !a.effacer && !restaure) { restaure = true; retrouver(); }
-      hauteur();
-    }
-  });
-  var restaure = false, timer = null;
-  function garder(v) {
-    try { if (v.data.length < 3500000) { localStorage.setItem("photo_en_cours", JSON.stringify({t: Date.now(), v: v})); } } catch (e) {}
-  }
-  function retrouver() {
-    try {
-      var s = JSON.parse(localStorage.getItem("photo_en_cours") || "null");
-      if (s && s.v && Date.now() - s.t < 900000) {
-        info.textContent = "✅ Photo retrouvée après le rechargement de la page"; hauteur();
-        envoyer("streamlit:setComponentValue", {value: s.v, dataType: "json"});
-      }
-    } catch (e) {}
-  }
-  function taille(w, h) { var k = Math.min(1, MAX / Math.max(w, h)); return [Math.round(w * k), Math.round(h * k)]; }
-  function versJpeg(source, w, h) {
-    var t = taille(w, h), c = document.createElement("canvas");
-    c.width = t[0]; c.height = t[1];
-    c.getContext("2d").drawImage(source, 0, 0, t[0], t[1]);
-    return new Promise(function (ok, ko) {
-      c.toBlob(function (b) { c.width = 0; c.height = 0; if (b) { ok([b, t[0], t[1]]); } else { ko(new Error("toBlob")); } },
-               "image/jpeg", QUALITE);
-    });
-  }
-  function viaImage(file) {
-    return new Promise(function (ok, ko) {
-      var u = URL.createObjectURL(file), im = new Image();
-      im.onload = function () { URL.revokeObjectURL(u); versJpeg(im, im.naturalWidth, im.naturalHeight).then(ok, ko); };
-      im.onerror = function () { URL.revokeObjectURL(u); ko(new Error("image")); };
-      im.src = u;
-    });
-  }
-  function viaBitmap(file) {
-    return createImageBitmap(file, {imageOrientation: "from-image"}).then(function (bmp) {
-      return versJpeg(bmp, bmp.width, bmp.height).then(function (r) { if (bmp.close) { bmp.close(); } return r; });
-    });
-  }
-  function finir(blob, w, h) {
-    var lecteur = new FileReader();
-    lecteur.onload = function () {
-      var data = String(lecteur.result).split(",")[1];
-      ap.src = URL.createObjectURL(blob); ap.style.display = "block";
-      info.textContent = "✅ Photo prête (" + Math.round(blob.size / 1024) + " Ko)";
-      hauteur();
-      var v = {data: data, w: w, h: h, nom: "photo.jpg", type: "image/jpeg", t: Date.now()};
-      garder(v);
-      envoyer("streamlit:setComponentValue", {value: v, dataType: "json"});
-      timer = setTimeout(function () {
-        info.textContent = "⚠️ La photo n'est pas arrivée dans l'application (connexion lente ?). Utilisez « Envoi classique » ci-dessous.";
-        hauteur();
-      }, 8000);
-    };
-    lecteur.onerror = function () { info.textContent = "❌ Lecture impossible : reprenez la photo."; hauteur(); };
-    lecteur.readAsDataURL(blob);
-  }
-  f.addEventListener("change", function () {
-    var file = f.files && f.files[0];
-    if (!file) { return; }
-    if (file.type === "application/pdf" || /\.pdf$/i.test(file.name || "")) {
-      if (file.size > 6000000) { info.textContent = "❌ PDF trop lourd (6 Mo maximum)."; hauteur(); f.value = ""; return; }
-      info.textContent = "⏳ Préparation du document…"; ap.style.display = "none"; hauteur();
-      var lp = new FileReader();
-      lp.onload = function () {
-        info.textContent = "✅ Document prêt (" + Math.round(file.size / 1024) + " Ko)"; hauteur();
-        var v = {data: String(lp.result).split(",")[1], nom: file.name, type: "application/pdf", t: Date.now()};
-        garder(v);
-        envoyer("streamlit:setComponentValue", {value: v, dataType: "json"});
-        f.value = "";
-      };
-      lp.onerror = function () { info.textContent = "❌ Lecture impossible : réessayez."; hauteur(); };
-      lp.readAsDataURL(file);
-      return;
-    }
-    info.textContent = "⏳ Préparation de la photo…"; ap.style.display = "none"; hauteur();
-    var p = window.createImageBitmap ? viaBitmap(file).catch(function () { return viaImage(file); }) : viaImage(file);
-    p.then(function (r) { finir(r[0], r[1], r[2]); })
-     .catch(function () { info.textContent = "❌ Photo illisible : reprenez-la."; hauteur(); })
-     .then(function () { f.value = ""; });
-  });
-  hauteur();
-})();
-</script></body></html>"""
-
-_dossier_capture = pathlib.Path(tempfile.gettempdir()) / "composant_capture_photo_v4"
-_dossier_capture.mkdir(parents=True, exist_ok=True)
-(_dossier_capture / "index.html").write_text(CAPTURE_HTML, encoding="utf-8")
-capture_photo = components.declare_component("capture_photo", path=str(_dossier_capture))
-
-
-def photo_du_telephone(cle: str, libelle: str, mode: str = "photo"):
-    """(octets, nom) de la photo ou du document choisi dans le téléphone (déjà réduit), ou (None, "")."""
-    deja = st.session_state.get("recu_" + cle)
-    valeur = capture_photo(libelle=libelle, mode=mode, restaurer=bool(st.session_state.get("reprise")),
-                           effacer=bool(st.session_state.pop("effacer_photo", False)),
-                           recu=bool(deja), taille=(len(deja[0]) // 1024 if deja else 0), key=cle, default=None)
-    if valeur and valeur.get("data"):
-        st.session_state["recu_" + cle] = (base64.b64decode(valeur["data"]), valeur.get("nom") or "photo.jpg")
-    return st.session_state.get("recu_" + cle, (None, ""))
 
 
 SCRIPT_URL, TOKEN, ACCESS_CODE = setting("SCRIPT_URL"), setting("TOKEN"), setting("ACCESS_CODE")
@@ -417,7 +278,7 @@ def factures_recues():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 8 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 9 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -437,25 +298,29 @@ auteur = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
 mode = st.radio("Comment ajouter la facture ?",
                 ["📷 Prendre une photo", "🧾 Scanner un document", "📎 Joindre un fichier"])
 recadrer = st.checkbox("Recadrer automatiquement la feuille (conseillé)", value=True)
-data, name = None, ""
 if mode.startswith("📷"):
-    st.caption("Facture bien à plat, bien éclairée, en entier dans l'image.")
-    data, name = photo_du_telephone(f"photo_{n}", "📷 Prendre la photo", "photo")
+    st.caption("Touchez le bouton, puis choisissez « Prendre une photo » (iPhone) ou « Appareil photo » (Android). "
+               "Facture bien à plat, bien éclairée, en entier.")
+    types, libelle = ["jpg", "jpeg", "png"], "📷 Prendre une photo de la facture"
 elif mode.startswith("🧾"):
     st.caption("La feuille est détectée, découpée et redressée.")
-    data, name = photo_du_telephone(f"scan_{n}", "🧾 Scanner la feuille", "photo")
+    types, libelle = ["jpg", "jpeg", "png"], "🧾 Photographier le document"
 else:
-    st.caption("Une photo de la galerie ou de l'appareil photo, ou un document PDF.")
-    data, name = photo_du_telephone(f"fichier_{n}", "📎 Choisir une photo ou un document", "fichier")
+    st.caption("Une photo de la galerie, ou un document PDF.")
+    types, libelle = ["pdf", "jpg", "jpeg", "png"], "📎 Choisir une photo ou un document"
 
-types_classiques = ["pdf", "png", "jpg", "jpeg"] if mode.startswith("📎") else ["png", "jpg", "jpeg"]
-st.markdown("**Envoi classique** (si le bouton rouge ne fonctionne pas) :")
-classique = st.file_uploader("Choisir une photo" if not mode.startswith("📎") else "Choisir une photo ou un PDF",
-                             type=types_classiques, key=f"classique_{n}_{len(types_classiques)}")
-if classique:
-    st.session_state[f"recu_classique_{n}"] = (classique.getvalue(), classique.name)
-if data is None and st.session_state.get(f"recu_classique_{n}"):
-    data, name = st.session_state[f"recu_classique_{n}"]
+envoi = st.file_uploader(libelle, type=types, key=f"envoi_{mode[:1]}_{n}")
+if envoi:
+    signature = (envoi.name, envoi.size)
+    if st.session_state.get(f"sig_{n}") != signature:             # une seule fois par fichier
+        st.session_state[f"sig_{n}"] = signature
+        brut = envoi.getvalue()
+        try:
+            brut = core.reduire_photo(brut, envoi.name)             # photo réduite : peu de mémoire, envoi rapide
+        except Exception:  # noqa: BLE001
+            pass
+        st.session_state[f"recu_{n}"] = (brut, envoi.name)         # mémorisé dès la réception
+data, name = st.session_state.get(f"recu_{n}", (None, ""))
 
 if data is None:
     st.info("Ajoutez une facture : le formulaire s'affichera aussitôt.")
@@ -515,10 +380,7 @@ else:
 
 amount_in = st.number_input("Montant TTC (€)", min_value=0.0, step=0.01, format="%.2f", key=f"amt_{fh}")
 date_in = st.date_input("Date de la facture", format="DD/MM/YYYY", key=f"date_{fh}")
-if f"cat_{fh}" in st.session_state:
-    cat = st.selectbox("Catégorie", cats, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
-else:
-    cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
+cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
 
 if cat:
     st.info(f"➡️ **{cat}** · **{MOIS[date_in.month - 1]} {date_in.year}** · **{eur(amount_in)}**")
@@ -545,7 +407,6 @@ if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
             msg += " (La facture est bien enregistrée, mais sa photo n'a pas pu être conservée.)"
         st.session_state["message"] = msg
         st.session_state["n"] = n + 1
-        st.session_state["effacer_photo"] = True         # la photo gardée dans le téléphone n'est plus utile
         st.rerun()
 
 # Lecture automatique : en DERNIER, une fois le formulaire affiché. Une erreur ou un dépassement de temps

@@ -905,3 +905,22 @@ def maintenant_fr() -> dt.datetime:
         return dt.datetime.now(ZoneInfo("Europe/Paris"))
     except Exception:  # noqa: BLE001  (pas de base de fuseaux : on prend l'heure de l'appareil)
         return dt.datetime.now()
+
+
+def reduire_photo(data: bytes, nom: str = "", max_cote: int = 1800, qualite: int = 85) -> bytes:
+    """
+    Photo reçue → JPEG réduit (1800 px max, EXIF appliqué) : mémoire du serveur et envois allégés.
+    Les PDF sont rendus tels quels.
+    """
+    if nom.lower().endswith(".pdf") or data[:5] == b"%PDF-":
+        return data
+    img = Image.open(io.BytesIO(data))
+    try:
+        img.draft("RGB", (max_cote, max_cote))
+    except Exception:  # noqa: BLE001
+        pass
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((max_cote, max_cote), Image.LANCZOS)
+    sortie = io.BytesIO()
+    img.save(sortie, "JPEG", quality=qualite, optimize=True)
+    return sortie.getvalue()
