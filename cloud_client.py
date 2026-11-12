@@ -65,7 +65,8 @@ def ping(url: str, token: str) -> bool:
 def add_entry(url: str, token: str, *, auteur: str, date_facture: str, categorie: str,
               montant: float, source: str = "", entry_id: str | None = None,
               photo: bytes | None = None, photo_type: str = "image/jpeg",
-              deja_appliquee: bool = False) -> dict:
+              deja_appliquee: bool = False, fournisseur: str = "", objet: str = "",
+              numero_facture: str = "", mode_paiement: str = "") -> dict:
     """Dépose une facture dans le Google Sheet (et sa photo dans le Drive si `photo` est fournie)."""
     payload = {"id": entry_id or uuid.uuid4().hex, "auteur": auteur, "date_facture": date_facture,
                "categorie": categorie, "montant": round(float(montant), 2), "source": source}
@@ -74,11 +75,19 @@ def add_entry(url: str, token: str, *, auteur: str, date_facture: str, categorie
         payload["photo_type"] = photo_type
     if deja_appliquee:
         payload["statut"] = "appliqué"
+    payload.update({"fournisseur": fournisseur, "objet": objet, "numero_facture": numero_facture,
+                    "mode_paiement": mode_paiement})
     return _call(url, token, "add", payload)
 
 
 def list_pending(url: str, token: str) -> list[dict]:
     return _call(url, token, "list_pending", method="GET")["rows"]
+
+
+def get_file(url: str, token: str, reference: str):
+    """(octets, nom, type) d'un justificatif du Drive, d'après son adresse : pour l'enregistrer sur le PC."""
+    r = _call(url, token, "get_file", {"url": reference})
+    return base64.b64decode(r["data"]), r.get("nom", "justificatif"), r.get("type", "application/pdf")
 
 
 def list_all(url: str, token: str) -> list[dict]:

@@ -300,7 +300,7 @@ def _copy_row_style(ws, lay: Layout, src_row: int, dst_row: int):
 
 def record_amount(path, sheet: str, which: str, month: int, amount: float, *,
                   label: str | None = None, new_label: str | None = None,
-                  make_backup: bool = True) -> dict:
+                  make_backup: bool = True, detail: dict | None = None) -> dict:
     """
     Ajoute `amount` dans (catégorie × mois) du bloc `which` ('sorties' ou 'entrees').
     `new_label` crée la catégorie dans la première ligne libre du bloc.
@@ -338,13 +338,14 @@ def record_amount(path, sheet: str, which: str, month: int, amount: float, *,
     col = lay.month_cols[int(month)]
     cell = ws.cell(row, col)
     old, new = add_amount(cell, amount)
+    detail_res = ecrire_detail(ws, lay, detail) if detail else None
     if make_backup:
         backup = save_with_backup(wb, path)
     else:                     # lot de plusieurs lignes : une seule sauvegarde pour tout le lot
         wb.save(path)
         backup = None
     return {"row": row, "col": col, "cell": cell.coordinate, "old": old, "new": new,
-            "label": str(ws.cell(row, lay.label_col).value).strip(), "backup": backup}
+            "label": str(ws.cell(row, lay.label_col).value).strip(), "backup": backup, "detail": detail_res}
 
 
 def log_operation(path, **fields):
@@ -924,3 +925,166 @@ def reduire_photo(data: bytes, nom: str = "", max_cote: int = 1800, qualite: int
     sortie = io.BytesIO()
     img.save(sortie, "JPEG", quality=qualite, optimize=True)
     return sortie.getvalue()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TABLEAU DU BAS : « Fournisseur & Détail de l'achat · Désignation · N° Facture · Date · Mode de paiement ·
+#  Montant · Justificatif »
+# ════════════════════════════════════════════════════════════════════════════
+def trouver_tableau_detail(ws, lay: Layout):
+    """(ligne d'en-tête, {rôle: n° de colonne}) du tableau de détail, ou None s'il n'existe pas dans la feuille."""
+    fin = min(ws.max_row, lay.sorties.total_row + 80)
+    largeur = min(ws.max_column, 25)
+    for r in range(lay.sorties.total_row + 1, fin + 1):
+        if not any(norm(ws.cell(r, c).value).startswith("fournisseur") for c in range(1, largeur + 1)):
+            continue
+        cols = {}
+        for c in range(1, largeur + 1):
+            n = norm(ws.cell(r, c).value)
+            if not n:
+                continue
+            if "fournisseur" in n:
+                cols["fournisseur"] = c
+            elif "designation" in n or "objet" in n:
+                cols["objet"] = c
+            elif "facture" in n:
+                cols["facture"] = c
+            elif n.startswith("date"):
+                cols["date"] = c
+            elif "paiement" in n:
+                cols["paiement"] = c
+            elif "montant" in n:
+                cols["montant"] = c
+            elif "justificatif" in n:
+                cols["justificatif"] = c
+        if "fournisseur" in cols and "montant" in cols:
+            return r, cols
+    return None
+
+
+def ecrire_detail(ws, lay: Layout, d: dict):
+    """
+    Ajoute une ligne dans le tableau du bas (première ligne libre, en dessous des lignes déjà remplies).
+    d : fournisseur, objet, facture, date (datetime.date), paiement, montant, justificatif_lien (chemin relatif ou adresse).
+    Retourne {"ligne": n, "cellule_justificatif": "G52"} ou None si le tableau est introuvable.
+    """
+    from copy import copy as _copy
+    from openpyxl.styles import Font
+
+    trouve = trouver_tableau_detail(ws, lay)
+    if not trouve:
+        return None
+    entete, cols = trouve
+    cles = [cols[k] for k in ("fournisseur", "objet", "facture", "date", "paiement", "montant") if k in cols]
+    r = entete + 1
+    while r < entete + 800 and any(ws.cell(r, c).value not in (None, "") for c in cles):
+        r += 1
+    # au-delà des lignes déjà dessinées : on reprend la mise en forme de la ligne du dessus
+    if r > entete + 1 and ws.cell(r, min(cols.values())).border.left.style is None:
+        for c in cols.values():
+            ws.cell(r, c)._style = _copy(ws.cell(r - 1, c)._style)
+
+    def poser(role, valeur, format_=None):
+        if role not in cols or valeur in (None, ""):
+            return
+        cell = ws.cell(r, cols[role])
+        try:
+            format_avant = cell.number_format
+            cell.value = valeur                  # openpyxl pose lui-même « aaaa-mm-jj » sur une date
+            if format_ and format_avant == "General":
+                cell.number_format = format_     # …on met le format français, sauf si la case a déjà le sien
+        except AttributeError:          # cellule fusionnée : on la laisse
+            pass
+
+    poser("fournisseur", d.get("fournisseur"))
+    poser("objet", d.get("objet"))
+    poser("facture", d.get("facture"))
+    poser("date", d.get("date"), "DD/MM/YYYY")
+    poser("paiement", d.get("paiement"))
+    poser("montant", round(float(d["montant"]), 2) if d.get("montant") is not None else None, '#,##0.00 "€"')
+    cell_just = None
+    if "justificatif" in cols and d.get("justificatif_lien"):
+        cell = ws.cell(r, cols["justificatif"])
+        try:
+            cell.value = "📄 PDF"
+            cell.hyperlink = d["justificatif_lien"]
+            cell.font = Font(color="0563C1", underline="single")
+            cell_just = cell.coordinate
+        except AttributeError:
+            pass
+    return {"ligne": r, "cellule_justificatif": cell_just}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  DÉTECTION DES CHAMPS D'UNE FACTURE ET PDF
+# ════════════════════════════════════════════════════════════════════════════
+_NON_FOURNISSEUR = re.compile(r"facture|ticket|re[cç]u|date|total|tva|siret|siren|\btel\b|fax|www|http|@|rue |avenue|chemin|route|"
+                              r"\bcb\b|merci|client|duplicata|page ")
+
+
+def find_supplier(text: str) -> str:
+    """Nom du fournisseur : première ligne qui ressemble à un nom de commerce (à corriger si besoin)."""
+    for ligne in text.splitlines()[:14]:
+        brut = re.sub(r"\s+", " ", ligne).strip(" -—_|.:;,*#")
+        if len(brut) < 3 or len(re.findall(r"[A-Za-zÀ-ÿ]", brut)) < 3 or re.search(r"\d{4,}", brut):
+            continue
+        if _NON_FOURNISSEUR.search(norm(brut)):
+            continue
+        return brut[:60]
+    return ""
+
+
+def find_invoice_number(text: str) -> str:
+    """Numéro de facture (« FACTURE N° 202609060335 », « N° de facture : A123 »...), ou chaîne vide."""
+    modeles = [r"n\s*[°º]\s*(?:de\s*)?facture\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})",
+               r"(?:facture|fact\.?|invoice|ticket|re[cç]u)\s*(?:n\s*[°º.]?|num[eé]ro|#)?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})"]
+    for modele in modeles:
+        for m in re.finditer(modele, text, re.I):
+            jeton = m.group(1).strip("-/")
+            if re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", jeton) or norm(jeton) in ("date", "numero", "client"):
+                continue
+            if sum(ch.isdigit() for ch in jeton) >= 3:
+                return jeton
+    # dernier recours : « N° 00451 » sur une ligne qui parle de ticket / facture / caisse / commande
+    for ligne in text.splitlines():
+        if re.search(r"ticket|caisse|facture|re[cç]u|commande", ligne, re.I):
+            m = re.search(r"n\s*[°º]\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{2,24})", ligne, re.I)
+            if m and sum(ch.isdigit() for ch in m.group(1)) >= 3 and not re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", m.group(1)):
+                return m.group(1).strip("-/")
+    return ""
+
+
+def find_payment(text: str) -> str:
+    """Mode de paiement : « CB », « Chèque » ou « Espèces » (par défaut)."""
+    n = norm(text)
+    if re.search(r"\b(cheque|chq)\b", n):
+        return "Chèque"
+    if re.search(r"carte bancaire|carte bleue|\bcb\b|visa|mastercard|contactless|sans contact", n):
+        return "CB"
+    return "Espèces"
+
+
+def en_pdf(data: bytes, nom: str = "") -> bytes:
+    """Photo → PDF d'une page A4 (un PDF reçu est conservé tel quel)."""
+    if nom.lower().endswith(".pdf") or data[:5] == b"%PDF-":
+        return data
+    img = Image.open(io.BytesIO(data))
+    try:
+        img.draft("RGB", (2600, 2600))
+    except Exception:  # noqa: BLE001
+        pass
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((2400, 2400), Image.LANCZOS)
+    w, h = img.size
+    page_l, page_h = (8.27, 11.69) if h >= w else (11.69, 8.27)       # A4, portrait ou paysage
+    resolution = max(w / page_l, h / page_h)
+    sortie = io.BytesIO()
+    img.save(sortie, "PDF", resolution=resolution, quality=85)
+    return sortie.getvalue()
+
+
+def nom_fichier_sur(*morceaux, max_len: int = 70) -> str:
+    """Nom de fichier sans accent ni caractère spécial (utilisable dans un lien Excel)."""
+    brut = "_".join(norm(m) for m in morceaux if m)
+    brut = re.sub(r"[^a-z0-9]+", "-", brut).strip("-")
+    return brut[:max_len] or "justificatif"

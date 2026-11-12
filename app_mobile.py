@@ -197,21 +197,19 @@ def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
     vignette.save(apercu, "JPEG", quality=80, optimize=True)
     return {"amount": montant, "candidates": candidats, "date": core.find_date(texte), "text": texte,
             "suggestion": core.suggest_category(texte, cats), "preview_jpeg": apercu.getvalue(),
-            "floue": bool(qualite and qualite["floue"])}
+            "fournisseur": core.find_supplier(texte), "numero": core.find_invoice_number(texte),
+            "paiement": core.find_payment(texte), "floue": bool(qualite and qualite["floue"])}
 
 
 def photo_a_envoyer(raw: bytes, nom: str, lect: dict | None):
-    """(octets, type) de la pièce justificative conservée dans le Drive : PDF d'origine, ou image recadrée et légère."""
+    """(octets, type) du justificatif conservé : PDF d'origine, ou la photo (recadrée) convertie en PDF."""
     if nom.lower().endswith(".pdf") or raw[:5] == b"%PDF-":
         return raw, "application/pdf"
-    if lect and lect.get("preview_jpeg"):
-        return lect["preview_jpeg"], "image/jpeg"
-    from PIL import Image
-    img = Image.open(io.BytesIO(raw))
-    img.thumbnail((1800, 1800))
-    sortie = io.BytesIO()
-    img.convert("RGB").save(sortie, "JPEG", quality=82, optimize=True)
-    return sortie.getvalue(), "image/jpeg"
+    source = lect["preview_jpeg"] if lect and lect.get("preview_jpeg") else raw
+    try:
+        return core.en_pdf(source, "photo.jpg"), "application/pdf"
+    except Exception:  # noqa: BLE001      si la conversion échoue, on garde au moins la photo
+        return core.reduire_photo(source, "photo.jpg"), "image/jpeg"
 
 
 def factures_recues():
@@ -240,7 +238,9 @@ def factures_recues():
         doublon = cle in vues
         vues.add(cle)
         lignes.append({"Valider": tout and not doublon, "Date": dt.date.fromisoformat(r["date_facture"]),
-                       "Auteur": r["auteur"], "Catégorie": r["categorie"], "Montant (€)": float(r["montant"]),
+                       "Auteur": r["auteur"], "Fournisseur": r.get("fournisseur", ""), "Désignation": r.get("objet", ""),
+                       "N° facture": r.get("numero_facture", ""), "Paiement": r.get("mode_paiement") or "Espèces",
+                       "Catégorie": r["categorie"], "Montant (€)": float(r["montant"]),
                        "Photo": r.get("photo_url") or None,
                        "Remarque": "Doublon possible" if doublon else "", "id": r["id"]})
     options = list(cats) + sorted({x["Catégorie"] for x in lignes if x["Catégorie"] not in cats})
@@ -249,6 +249,7 @@ def factures_recues():
         column_config={"id": None,
                        "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY", required=True),
                        "Catégorie": st.column_config.SelectboxColumn("Catégorie", options=options, required=True),
+                       "Paiement": st.column_config.SelectboxColumn("Paiement", options=["CB", "Chèque", "Espèces"]),
                        "Montant (€)": st.column_config.NumberColumn(format="%.2f", min_value=0.01),
                        "Photo": st.column_config.LinkColumn("Photo", display_text="Ouvrir")})
     cochees = edite[edite["Valider"]]
@@ -256,7 +257,9 @@ def factures_recues():
     gauche, droite = st.columns(2)
     if gauche.button("✅ Valider", type="primary", disabled=cochees.empty):
         items = [{"id": r["id"], "categorie": r["Catégorie"], "montant": float(r["Montant (€)"]),
-                  "date_facture": pd.Timestamp(r["Date"]).date().isoformat()} for _, r in cochees.iterrows()]
+                  "date_facture": pd.Timestamp(r["Date"]).date().isoformat(),
+                  "fournisseur": r["Fournisseur"], "objet": r["Désignation"], "numero_facture": r["N° facture"],
+                  "mode_paiement": r["Paiement"]} for _, r in cochees.iterrows()]
         try:
             nb = cloud.validate(SCRIPT_URL, TOKEN, items)
         except cloud.CloudError as e:
@@ -278,7 +281,7 @@ def factures_recues():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 9 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 10 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -352,8 +355,15 @@ if lect and not st.session_state.get("init_" + cle_lect):
             st.session_state[f"date_{fh}"] = lect["date"]
         if lect.get("suggestion") is not None and lect["suggestion"] < len(cats):
             st.session_state[f"cat_{fh}"] = cats[lect["suggestion"]]
+    if not st.session_state.get(f"four_{fh}") and lect.get("fournisseur"):
+        st.session_state[f"four_{fh}"] = lect["fournisseur"]
+    if not st.session_state.get(f"num_{fh}") and lect.get("numero"):
+        st.session_state[f"num_{fh}"] = lect["numero"]
+    if lect.get("paiement"):
+        st.session_state[f"pay_{fh}"] = lect["paiement"]
 st.session_state.setdefault(f"amt_{fh}", 0.0)
 st.session_state.setdefault(f"date_{fh}", dt.date.today())
+st.session_state.setdefault(f"pay_{fh}", "Espèces")
 
 if lect and lect.get("preview_jpeg"):
     st.image(lect["preview_jpeg"], caption="Document recadré")
@@ -381,6 +391,10 @@ else:
 amount_in = st.number_input("Montant TTC (€)", min_value=0.0, step=0.01, format="%.2f", key=f"amt_{fh}")
 date_in = st.date_input("Date de la facture", format="DD/MM/YYYY", key=f"date_{fh}")
 cat = st.selectbox("Catégorie", cats, index=None, placeholder="Choisir une catégorie…", key=f"cat_{fh}")
+fournisseur_in = st.text_input("Fournisseur (ex. Leroy Merlin)", key=f"four_{fh}")
+objet_in = st.text_input("Désignation / Objet", key=f"objet_{fh}", placeholder="Ex. : arrosoir, gants")
+numero_in = st.text_input("N° de facture", key=f"num_{fh}")
+paiement_in = st.selectbox("Mode de paiement", ["CB", "Chèque", "Espèces"], key=f"pay_{fh}")
 
 if cat:
     st.info(f"➡️ **{cat}** · **{MOIS[date_in.month - 1]} {date_in.year}** · **{eur(amount_in)}**")
@@ -394,7 +408,8 @@ if st.button("📤 Envoyer au trésorier", type="primary", disabled=not ready):
         photo, photo_type = photo_a_envoyer(data, name, lect)
         res = cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur.strip(), date_facture=date_in.isoformat(),
                               categorie=cat, montant=amount_in, source=f"mobile:{name}", entry_id=entry_id,
-                              photo=photo, photo_type=photo_type)
+                              photo=photo, photo_type=photo_type, fournisseur=fournisseur_in.strip(),
+                              objet=objet_in.strip(), numero_facture=numero_in.strip(), mode_paiement=paiement_in)
     except cloud.CloudError as e:
         st.error(f"Envoi impossible : {e}")
     except Exception as e:  # noqa: BLE001
