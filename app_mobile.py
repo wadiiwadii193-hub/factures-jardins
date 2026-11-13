@@ -189,16 +189,18 @@ def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
     if texte is None:
         lecture = core.read_invoice(images, "Tesseract")
         texte, montant, candidats = lecture["text"], lecture["amount"], lecture["candidates"]
+        champs = core.extraire_champs(lecture)
     else:
         montant, candidats = core.find_amount(texte)
+        champs = core.extraire_champs(None, texte)
     apercu = io.BytesIO()
     vignette = preview.convert("RGB")
     vignette.thumbnail((1600, 1600))
     vignette.save(apercu, "JPEG", quality=80, optimize=True)
     return {"amount": montant, "candidates": candidats, "date": core.find_date(texte), "text": texte,
             "suggestion": core.suggest_category(texte, cats), "preview_jpeg": apercu.getvalue(),
-            "fournisseur": core.find_supplier(texte), "numero": core.find_invoice_number(texte),
-            "paiement": core.find_payment(texte), "floue": bool(qualite and qualite["floue"])}
+            "fournisseur": champs["fournisseur"], "objet": champs["objet"], "numero": champs["numero"],
+            "paiement": champs["paiement"], "floue": bool(qualite and qualite["floue"])}
 
 
 def photo_a_envoyer(raw: bytes, nom: str, lect: dict | None):
@@ -281,7 +283,7 @@ def factures_recues():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 10 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 11 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -357,6 +359,8 @@ if lect and not st.session_state.get("init_" + cle_lect):
             st.session_state[f"cat_{fh}"] = cats[lect["suggestion"]]
     if not st.session_state.get(f"four_{fh}") and lect.get("fournisseur"):
         st.session_state[f"four_{fh}"] = lect["fournisseur"]
+    if not st.session_state.get(f"objet_{fh}") and lect.get("objet"):
+        st.session_state[f"objet_{fh}"] = lect["objet"]
     if not st.session_state.get(f"num_{fh}") and lect.get("numero"):
         st.session_state[f"num_{fh}"] = lect["numero"]
     if lect.get("paiement"):

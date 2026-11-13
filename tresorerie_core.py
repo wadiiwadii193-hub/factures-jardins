@@ -613,8 +613,14 @@ def ocr_donnees(img: Image.Image, psm: int = 6):
         t = (t or "").strip()
         if not t:
             continue
-        mots.append({"t": t, "n": norm(t), "x": d["left"][k], "y": d["top"][k], "w": d["width"][k], "h": d["height"][k]})
-        lignes.setdefault((d["block_num"][k], d["par_num"][k], d["line_num"][k]), []).append(t)
+        try:
+            conf = float(d["conf"][k])
+        except (TypeError, ValueError):
+            conf = -1.0
+        cle_ligne = (d["block_num"][k], d["par_num"][k], d["line_num"][k])
+        mots.append({"t": t, "n": norm(t), "x": d["left"][k], "y": d["top"][k], "w": d["width"][k], "h": d["height"][k],
+                     "c": conf, "l": cle_ligne})
+        lignes.setdefault(cle_ligne, []).append(t)
     texte = "\n".join(" ".join(v) for _, v in sorted(lignes.items()))
     return texte, mots
 
@@ -707,15 +713,22 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
 
     debut = time.time()
     total = None
+    mots_premiere, entete = [], []
     if engine.lower().startswith("easy"):
         texte = run_ocr(images, engine)
     else:
         morceaux = []
-        for im in images:
+        for i_im, im in enumerate(images):
             t_im, mots = ocr_donnees(im)
             morceaux.append(t_im)
             if total is None:
                 total = find_total_in_words(mots)
+            if i_im == 0:
+                mots_premiere = mots
+                try:
+                    entete = lignes_fiables(ocr_donnees(im.crop((0, 0, im.size[0], max(1, int(im.size[1] * 0.28)))), psm=11)[1], 70)
+                except Exception:  # noqa: BLE001      l'en-tête est un plus : jamais bloquant
+                    entete = []
         texte = "\n".join(morceaux)
     meilleur, candidats = find_amount(texte)
     if meilleur is None and total is None and not engine.lower().startswith("easy") and time.time() - debut < 15:
@@ -727,7 +740,8 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
     if total:
         meilleur = total
         candidats = [total] + [c for c in candidats if c != total]
-    return {"text": texte, "amount": meilleur, "candidates": candidats[:6]}
+    return {"text": texte, "amount": meilleur, "candidates": candidats[:6],
+            "mots": [{"t": m["t"], "c": m["c"], "l": m["l"]} for m in mots_premiere], "entete": entete}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -931,35 +945,34 @@ def reduire_photo(data: bytes, nom: str = "", max_cote: int = 1800, qualite: int
 #  TABLEAU DU BAS : « Fournisseur & Détail de l'achat · Désignation · N° Facture · Date · Mode de paiement ·
 #  Montant · Justificatif »
 # ════════════════════════════════════════════════════════════════════════════
+# Plan des colonnes, par rapport à la colonne « Fournisseur » (A) : B = Désignation (C fusionnée, ignorée), D = N° facture,
+# E = Date, F = Mode de paiement, G = Montant, H = Justificatif. Pour changer le plan, modifier ces décalages.
+DECALAGES_DETAIL = {"fournisseur": 0, "objet": 1, "facture": 3, "date": 4, "paiement": 5, "montant": 6, "justificatif": 7}
+_ENTETES_ATTENDUS = {"objet": ("designation", "objet"), "facture": ("facture",), "date": ("date",), "paiement": ("paiement",),
+                     "montant": ("montant",), "justificatif": ("justificatif",)}
+
+
 def trouver_tableau_detail(ws, lay: Layout):
-    """(ligne d'en-tête, {rôle: n° de colonne}) du tableau de détail, ou None s'il n'existe pas dans la feuille."""
+    """(ligne d'en-tête, {rôle: n° de colonne}, avertissements) du tableau de détail, ou None s'il n'existe pas."""
     fin = min(ws.max_row, lay.sorties.total_row + 80)
     largeur = min(ws.max_column, 25)
     for r in range(lay.sorties.total_row + 1, fin + 1):
-        if not any(norm(ws.cell(r, c).value).startswith("fournisseur") for c in range(1, largeur + 1)):
+        c0 = next((c for c in range(1, largeur + 1) if norm(ws.cell(r, c).value).startswith("fournisseur")), None)
+        if c0 is None:
             continue
-        cols = {}
-        for c in range(1, largeur + 1):
-            n = norm(ws.cell(r, c).value)
-            if not n:
-                continue
-            if "fournisseur" in n:
-                cols["fournisseur"] = c
-            elif "designation" in n or "objet" in n:
-                cols["objet"] = c
-            elif "facture" in n:
-                cols["facture"] = c
-            elif n.startswith("date"):
-                cols["date"] = c
-            elif "paiement" in n:
-                cols["paiement"] = c
-            elif "montant" in n:
-                cols["montant"] = c
-            elif "justificatif" in n:
-                cols["justificatif"] = c
-        if "fournisseur" in cols and "montant" in cols:
-            return r, cols
+        cols = {role: c0 + dec for role, dec in DECALAGES_DETAIL.items()}
+        alertes = []
+        for role, mots in _ENTETES_ATTENDUS.items():
+            n = norm(ws.cell(r, cols[role]).value)
+            if not any(m in n for m in mots):
+                alertes.append(f"colonne {openpyxl_lettre(cols[role])} : « {role} » attendu, en-tête trouvé « {ws.cell(r, cols[role]).value or 'vide'} »")
+        return r, cols, alertes
     return None
+
+
+def openpyxl_lettre(n: int) -> str:
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(n)
 
 
 def ecrire_detail(ws, lay: Layout, d: dict):
@@ -974,8 +987,8 @@ def ecrire_detail(ws, lay: Layout, d: dict):
     trouve = trouver_tableau_detail(ws, lay)
     if not trouve:
         return None
-    entete, cols = trouve
-    cles = [cols[k] for k in ("fournisseur", "objet", "facture", "date", "paiement", "montant") if k in cols]
+    entete, cols, alertes = trouve
+    cles = [cols[k] for k in ("fournisseur", "objet", "facture", "date", "paiement", "montant")]
     r = entete + 1
     while r < entete + 800 and any(ws.cell(r, c).value not in (None, "") for c in cles):
         r += 1
@@ -1012,46 +1025,145 @@ def ecrire_detail(ws, lay: Layout, d: dict):
             cell_just = cell.coordinate
         except AttributeError:
             pass
-    return {"ligne": r, "cellule_justificatif": cell_just}
+    return {"ligne": r, "cellule_justificatif": cell_just, "avertissement": " ; ".join(alertes)}
 
 
 # ════════════════════════════════════════════════════════════════════════════
 #  DÉTECTION DES CHAMPS D'UNE FACTURE ET PDF
 # ════════════════════════════════════════════════════════════════════════════
 _NON_FOURNISSEUR = re.compile(r"facture|ticket|re[cç]u|date|total|tva|siret|siren|\btel\b|fax|www|http|@|rue |avenue|chemin|route|"
-                              r"\bcb\b|merci|client|duplicata|page ")
+                              r"\bcb\b|merci|client|duplicata|page |bon de|devis|commande|livraison|r[eè]glement|iban|bic\b|"
+                              r"capital|r\.?c\.?s|n° tva|adresse|vendeur|caisse|op[eé]rateur")
+_FORMES_JURIDIQUES = r"(?:SAS|SARL|SA|EURL|SASU|SNC|SCOP|SCI)"
+_PAS_UN_COMMERCE = re.compile(r"banque|bank|credit|cr[eé]dit|caisse|assurance|epargne|[eé]pargne|palatine|mutuelle|poste")
+_FOURNISSEURS_GENERIQUES = {"orange", "free", "gmail", "hotmail", "outlook", "yahoo", "wanadoo", "sfr", "laposte", "live", "icloud"}
+_MOTS_DE_FACTURE = set("""facture total montant designation client date tva paiement carte bancaire net payer prix unitaire quantite
+reference adresse france avenue route siege social capital euros tel fax email banque iban bic siret siren code article remise
+base taux echeance reglement mode ticket caisse merci votre vous pour les des une avec sans par sur dans commande livraison
+conditions generales vente page duplicata original exemplaire numero compte contact horaires ouvert""".split())
 
 
-def find_supplier(text: str) -> str:
-    """Nom du fournisseur : première ligne qui ressemble à un nom de commerce (à corriger si besoin)."""
-    for ligne in text.splitlines()[:14]:
-        brut = re.sub(r"\s+", " ", ligne).strip(" -—_|.:;,*#")
-        if len(brut) < 3 or len(re.findall(r"[A-Za-zÀ-ÿ]", brut)) < 3 or re.search(r"\d{4,}", brut):
-            continue
-        if _NON_FOURNISSEUR.search(norm(brut)):
-            continue
-        return brut[:60]
+def lignes_fiables(mots, seuil: float = 55.0):
+    """Lignes de texte reconstruites avec les seuls mots lus de façon fiable (confiance Tesseract ≥ seuil)."""
+    lignes = {}
+    for m in mots:
+        if m.get("c", 100) >= seuil:
+            lignes.setdefault(m["l"], []).append(m["t"])
+    return [" ".join(v) for _, v in sorted(lignes.items())]
+
+
+def _ligne_propre(ligne: str) -> bool:
+    """Vrai si la ligne ressemble à du texte lu correctement (et non à du bruit venant d'un logo)."""
+    mots = re.findall(r"[A-Za-zÀ-ÿ0-9&'\-]+", ligne)
+    lettres = len(re.findall(r"[A-Za-zÀ-ÿ]", ligne))
+    if not mots or lettres < 3 or lettres < 0.65 * len(re.sub(r"\s", "", ligne)):
+        return False
+    courts = sum(len(re.sub(r"[^A-Za-zÀ-ÿ]", "", m)) <= 2 for m in mots)
+    return courts <= max(1, len(mots) // 4) and any(len(m) >= 4 for m in mots)
+
+
+def _nom_propre(nom: str) -> str:
+    nom = re.sub(r"(?i)^(si[eè]ge social|soci[eé]t[eé]|raison sociale|[eé]tablissements?|ets|ste)\s*[:\-]?\s*", "", nom)
+    nom = re.sub(r"\s+", " ", nom).strip(" -:;,.|_*#")
+    nom = re.sub(r"\s+" + _FORMES_JURIDIQUES + r"$", "", nom)
+    return (nom.title() if nom.isupper() else nom)[:60]
+
+
+def find_supplier(text: str, fiables=None, entete=None) -> str:
+    """
+    Nom du fournisseur : raison sociale (« VAUDAUX SA »), sinon nom du site web / de l'e-mail, sinon première ligne
+    de l'en-tête lue de façon fiable. Les lignes illisibles (logo mal lu) sont écartées.
+    """
+    lignes = [re.sub(r"\s+", " ", l).strip() for l in (fiables if fiables else text.splitlines())]
+    lignes += [re.sub(r"\s+", " ", l).strip() for l in (entete or [])]
+    tout = "\n".join(lignes)
+    # 1) raison sociale suivie de sa forme juridique
+    for m in re.finditer(r"([A-ZÀ-Ý][A-Za-zÀ-ÿ&'\-]+(?:\s+[A-Za-zÀ-ÿ&'\-]+){0,3}?)\s+" + _FORMES_JURIDIQUES + r"\b", tout):
+        nom = _nom_propre(m.group(1))
+        n = norm(nom)
+        if len(re.findall(r"[A-Za-zÀ-ÿ]", nom)) >= 4 and not _PAS_UN_COMMERCE.search(n) and not _NON_FOURNISSEUR.search(n) \
+                and _ligne_propre(nom):
+            return nom
+    # 2) site web ou adresse e-mail du fournisseur
+    for m in re.finditer(r"(?:www\.|@)([a-z0-9][a-z0-9\-]{2,24})\.(?:fr|com|net|org|eu|io)\b", tout.lower()):
+        if m.group(1) not in _FOURNISSEURS_GENERIQUES and not _PAS_UN_COMMERCE.search(m.group(1)):
+            return m.group(1).replace("-", " ").title()
+    # 3) première ligne propre de l'en-tête
+    for l in lignes[:14]:
+        brut = l.strip(" -—_|.:;,*#")
+        if _ligne_propre(brut) and not re.search(r"\d{4,}", brut) and not _NON_FOURNISSEUR.search(norm(brut)):
+            return _nom_propre(brut)
     return ""
+
+
+_NON_DESIGNATION = re.compile(r"\bqt[eé]?\b|quantit|prix|p\.?u\b|unit|montant|total|tva|taux|remise|r[eé]f[eé]rence|\bht\b|\bttc\b|"
+                              r"d[eé]signation|libell|description|\bcode\b|\bn°|tel\b|www|siret|iban|merci|remercie")
+
+
+def find_designation(text: str, fiables=None, max_lignes: int = 3) -> str:
+    """Description de l'achat : les premières lignes d'articles du tableau (prix et quantités retirés)."""
+    lignes = [re.sub(r"\s+", " ", l).strip() for l in (fiables if fiables else text.splitlines())]
+    debut = next((i for i, l in enumerate(lignes)
+                  if re.search(r"d[eé]signation|libell[eé]|description|article|produit", norm(l)) and not re.search(r"\d{5,}", l)), None)
+    zone = lignes[debut + 1:] if debut is not None else lignes[3:]
+    fin = re.compile(r"total|montant ht|net a payer|sous-total|remercie|r[eè]glement|echeance|merci|tva")
+    trouvees = []
+    for l in zone:
+        n = norm(l)
+        if fin.search(n) and trouvees:
+            break
+        propre = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:€|eur|euros?|%)?", " ", l)
+        propre = re.sub(r"[^A-Za-zÀ-ÿ'\- ]", " ", propre)
+        propre = re.sub(r"(?<![A-Za-zÀ-ÿ'\-])[A-Za-zÀ-ÿ](?![A-Za-zÀ-ÿ'\-])", " ", propre)     # « 10 L » → reste « L » : écarté
+        propre = re.sub(r"\s+", " ", propre).strip(" -'")
+        if len(propre) < 5 or not _ligne_propre(propre) or _NON_DESIGNATION.search(norm(propre)) or _NON_FOURNISSEUR.search(norm(propre)):
+            continue
+        trouvees.append(propre[:45])
+        if len(trouvees) >= max_lignes:
+            break
+    return " ; ".join(trouvees)[:120]
 
 
 def find_invoice_number(text: str) -> str:
-    """Numéro de facture (« FACTURE N° 202609060335 », « N° de facture : A123 »...), ou chaîne vide."""
-    modeles = [r"n\s*[°º]\s*(?:de\s*)?facture\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})",
-               r"(?:facture|fact\.?|invoice|ticket|re[cç]u)\s*(?:n\s*[°º.]?|num[eé]ro|#)?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})"]
+    """Numéro de facture (« FACTURE N° 202609060335 », « N° de facture : A123 », numéro sous l'en-tête...), ou chaîne vide."""
+    def valide(jeton: str) -> bool:
+        jeton = jeton.strip("-/")
+        return (sum(ch.isdigit() for ch in jeton) >= 3 and norm(jeton) not in ("date", "numero", "client")
+                and not re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", jeton))
+    signe = r"(?:n\s*[°º\"“”'*®]?|num[eé]ro|#)"
+    modeles = [r"n\s*[°º\"“”'*®]?\s*(?:de\s*)?facture\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})",
+               r"(?:facture|fact\.?|invoice|ticket|re[cç]u|avoir)\s*" + signe + r"?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})"]
     for modele in modeles:
         for m in re.finditer(modele, text, re.I):
-            jeton = m.group(1).strip("-/")
-            if re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", jeton) or norm(jeton) in ("date", "numero", "client"):
-                continue
-            if sum(ch.isdigit() for ch in jeton) >= 3:
-                return jeton
+            if valide(m.group(1)):
+                return m.group(1).strip("-/")
+    lignes = text.splitlines()
+    # en-tête de tableau « N° FACTURE | DATE | CLIENT » avec les valeurs sur la ligne du dessous
+    for i, l in enumerate(lignes):
+        if re.search(r"facture|invoice", l, re.I) and re.search(r"\bdate\b", l, re.I) and not re.search(r"\d{5,}", l):
+            for suivante in lignes[i + 1:i + 3]:
+                for jeton in re.findall(r"[A-Z0-9][A-Z0-9\-/]{4,24}", suivante, re.I):
+                    if valide(jeton) and sum(ch.isdigit() for ch in jeton) >= 5:
+                        return jeton.strip("-/")
     # dernier recours : « N° 00451 » sur une ligne qui parle de ticket / facture / caisse / commande
-    for ligne in text.splitlines():
-        if re.search(r"ticket|caisse|facture|re[cç]u|commande", ligne, re.I):
-            m = re.search(r"n\s*[°º]\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{2,24})", ligne, re.I)
-            if m and sum(ch.isdigit() for ch in m.group(1)) >= 3 and not re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", m.group(1)):
+    for l in lignes:
+        if re.search(r"ticket|caisse|facture|re[cç]u|commande", l, re.I):
+            m = re.search(r"n\s*[°º\"“”'*®]\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{2,24})", l, re.I)
+            if m and valide(m.group(1)):
                 return m.group(1).strip("-/")
     return ""
+
+
+def extraire_champs(lecture: dict | None = None, texte: str = "") -> dict:
+    """Fournisseur, désignation, n° de facture et mode de paiement d'une facture lue (résultat de read_invoice, ou texte seul)."""
+    if lecture:
+        texte = lecture.get("text", "")
+        fiables = lignes_fiables(lecture.get("mots", []), 60) or None
+        entete = lecture.get("entete") or []
+    else:
+        fiables, entete = None, []
+    return {"fournisseur": find_supplier(texte, fiables, entete), "objet": find_designation(texte, fiables),
+            "numero": find_invoice_number(texte + "\n" + "\n".join(entete)), "paiement": find_payment(texte)}
 
 
 def find_payment(text: str) -> str:
