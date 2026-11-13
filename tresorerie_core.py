@@ -735,11 +735,12 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
         texte += "\n" + run_ocr(images, engine, psm=4)          # 2e passe seulement si la 1re a été rapide
         meilleur, candidats = find_amount(texte)
     somme = _total_par_somme([float(m.group(0).replace(",", ".")) for m in re.finditer(r"\d+[.,]\d{2}", texte)])
-    if total and somme and total != somme[0] and total in somme[1]:
-        total = somme[0]                    # ex. 3,88 (TVA) repéré à tort : 19,42 + 3,88 = 23,30
-    if total:
-        meilleur = total
-        candidats = [total] + [c for c in candidats if c != total]
+    final = total or meilleur
+    if final is not None and somme and round(final, 2) in somme[1] and round(final, 2) != somme[0]:
+        final = somme[0]                    # ex. 3,88 (TVA) ou 19,42 (HT) repéré à tort : 19,42 + 3,88 = 23,30
+    if final is not None:
+        meilleur = final
+        candidats = [final] + [c for c in candidats if c != final]
     return {"text": texte, "amount": meilleur, "candidates": candidats[:6],
             "mots": [{"t": m["t"], "c": m["c"], "l": m["l"]} for m in mots_premiere], "entete": entete}
 
@@ -787,6 +788,30 @@ def _total_par_somme(valeurs):
     return meilleur
 
 
+def _eviter_tva_et_ht(best, lines, every):
+    """Si le montant retenu est celui d'une ligne TVA ou HT, on remonte au TTC (HT + TVA) ou au plus gros autre montant."""
+    if best is None:
+        return best
+    tva, ht = set(), set()
+    for line in lines:
+        n_l = norm(line)
+        valeurs = {round(_to_float(m), 2) for m in _AMOUNT.finditer(line)}
+        if re.search(r"tva|t\.v\.a|taxe", n_l) and "ttc" not in n_l:
+            tva |= valeurs
+        if re.search(r"\bht\b|hors taxe", n_l) and "ttc" not in n_l:
+            ht |= valeurs
+    if round(best, 2) not in tva | ht:
+        return best
+    ttc = next((c for c in sorted(every, reverse=True) if any(abs(c - (h + v)) < 0.011 for h in ht for v in tva)), None)
+    if ttc:
+        return ttc
+    if round(best, 2) in tva:
+        autres = [a for a in every if round(a, 2) not in tva | ht]
+        if autres:
+            return max(autres)
+    return best
+
+
 def find_amount(text: str):
     """Retourne (meilleur montant TTC ou None, liste des montants candidats)."""
     lines = text.splitlines()
@@ -808,6 +833,7 @@ def find_amount(text: str):
     else:
         somme = _total_par_somme(every)
         best = somme[0] if somme else (max(every) if every else None)
+    best = _eviter_tva_et_ht(best, lines, every)
     cands = []
     for a in ([best] if best else []) + [a for _, a in sorted(weighted, reverse=True)] + sorted(every, reverse=True):
         if a not in cands:
@@ -1097,20 +1123,79 @@ def find_supplier(text: str, fiables=None, entete=None) -> str:
 
 
 _NON_DESIGNATION = re.compile(r"\bqt[eé]?\b|quantit|prix|p\.?u\b|unit|montant|total|tva|taux|remise|r[eé]f[eé]rence|\bht\b|\bttc\b|"
-                              r"d[eé]signation|libell|description|\bcode\b|\bn°|tel\b|www|siret|iban|merci|remercie")
+                              r"d[eé]signation|libell|description|\bcode\b|\bn°|tel\b|www|siret|iban|merci|remercie|"
+                              r"banque|capital|siege|conditions|garantie|\brcs\b|exemplaire|original|duplicata")
+_ADMIN = re.compile(r"facture|client|repr[eé]sentant|adresse|\btel\b|t[eé]l[eé]phone|siret|\bdate\b|commande|livraison|\bpage\b|"
+                    r"mail|www|code postal|\b\d{5}\b|n[°º]|r[eé]f[eé]rence|vendeur|[eé]ch[eé]ance|mode de r[eè]glement")
+_FIN_TABLEAU = re.compile(r"total|montant ht|net a payer|sous-total|remercie|r[eè]glement|echeance|merci|tva|banque|capital|"
+                          r"siege|conditions|garantie|iban|\brcs\b")
+_OBJET_FORT = re.compile(r"r[eé]paration|remplacement|concernant|entretien|fourniture|achat|location|abonnement|cotisation|"
+                         r"intervention|installation|dépannage|depannage|maintenance", re.I)
+# mots courants des factures de jardin / bricolage : corrige les fautes de lecture (« concemant » → « concernant »)
+_VOCABULAIRE = """réparation remplacement concernant entretien fourniture fournitures achat pièces pièce pneu pneus roue roues
+autoportée autoportee tondeuse taille-haie débroussailleuse debroussailleuse huile essence carburant lame lames courroie bougie
+filtre graines plants terreau engrais outils outil arrosage arrosoir tuyau grillage clôture cloture peinture ciment béton beton
+bois vis clous main-d'œuvre mise place petites standard espace vert mèche meche constat intervention installation maintenance
+location abonnement cotisation cadenas serrure clé clés boîte boite lettres porte portail poteau planche planches sable gravier
+gants sécateur secateur râteau rateau pelle bêche beche brouette semences semis arbres arbuste arbustes haie""".split()
 
 
-def find_designation(text: str, fiables=None, max_lignes: int = 3) -> str:
-    """Description de l'achat : les premières lignes d'articles du tableau (prix et quantités retirés)."""
+def _mots_de(s: str) -> set:
+    return set(re.findall(r"[a-z]{3,}", norm(s)))
+
+
+def _recoupe(mots: set, reference: set) -> float:
+    """Part des mots de la ligne qui se retrouvent (à une faute de lecture près) dans la référence."""
+    import difflib
+    if not mots:
+        return 0.0
+    trouves = sum(any(m == r or difflib.SequenceMatcher(None, m, r).ratio() >= 0.8 for r in reference) for m in mots)
+    return trouves / len(mots)
+
+
+def _corriger_mots(texte: str) -> str:
+    import difflib
+    base = {norm(v): v for v in _VOCABULAIRE}
+    sortie = []
+    for mot in texte.split():
+        brut = re.sub(r"[^A-Za-zÀ-ÿ'\-]", "", mot)
+        if len(brut) >= 6 and norm(brut) not in base:
+            proche = difflib.get_close_matches(norm(brut), list(base), n=1, cutoff=0.84)
+            if proche:
+                v = base[proche[0]]
+                mot = mot.replace(brut, v.upper() if brut.isupper() else (v.capitalize() if brut[0].isupper() else v))
+        sortie.append(mot)
+    return " ".join(sortie)
+
+
+def _couper(texte: str, longueur: int) -> str:
+    if len(texte) <= longueur:
+        return texte
+    return texte[:longueur].rsplit(" ", 1)[0]
+
+
+def find_designation(text: str, fiables=None, entete=None, fournisseur: str = "", max_lignes: int = 2) -> str:
+    """
+    Objet réel de la dépense. Écarte l'en-tête (enseigne, slogan), les adresses, les totaux, les mentions légales
+    et les lignes qui répètent une ligne déjà prise ; corrige les fautes de lecture sur les mots courants.
+    """
     lignes = [re.sub(r"\s+", " ", l).strip() for l in (fiables if fiables else text.splitlines())]
     debut = next((i for i, l in enumerate(lignes)
-                  if re.search(r"d[eé]signation|libell[eé]|description|article|produit", norm(l)) and not re.search(r"\d{5,}", l)), None)
-    zone = lignes[debut + 1:] if debut is not None else lignes[3:]
-    fin = re.compile(r"total|montant ht|net a payer|sous-total|remercie|r[eè]glement|echeance|merci|tva")
-    trouvees = []
-    for l in zone:
+                  if re.search(r"d[eé]signation|libell[eé]|description", norm(l)) and not re.search(r"\d{5,}", l)), None)
+    if debut is not None:
+        depart = debut + 1
+    else:                                           # sans en-tête de tableau : après la dernière ligne administrative du haut
+        fin_idx = next((i for i, l in enumerate(lignes) if i > 2 and _FIN_TABLEAU.search(norm(l))), len(lignes))
+        admin = [i for i in range(min(fin_idx, 35)) if _ADMIN.search(norm(lignes[i]))]     # l'adresse du pied de page ne compte pas
+        depart = admin[-1] + 1 if admin else min(6, len(lignes))
+    # mots de l'en-tête : enseigne, slogan, nom du fournisseur → jamais dans la désignation
+    reference = set()
+    for l in lignes[:min(depart, 8)] + list(entete or [])[:3] + [fournisseur]:      # enseigne et slogan : tout en haut seulement
+        reference |= _mots_de(l)
+    trouvees, vus = [], []
+    for l in lignes[depart:]:
         n = norm(l)
-        if fin.search(n) and trouvees:
+        if _FIN_TABLEAU.search(n) and trouvees:
             break
         propre = re.sub(r"\b\d+(?:[.,]\d+)?\s*(?:€|eur|euros?|%)?", " ", l)
         propre = re.sub(r"[^A-Za-zÀ-ÿ'\- ]", " ", propre)
@@ -1118,10 +1203,16 @@ def find_designation(text: str, fiables=None, max_lignes: int = 3) -> str:
         propre = re.sub(r"\s+", " ", propre).strip(" -'")
         if len(propre) < 5 or not _ligne_propre(propre) or _NON_DESIGNATION.search(norm(propre)) or _NON_FOURNISSEUR.search(norm(propre)):
             continue
-        trouvees.append(propre[:45])
-        if len(trouvees) >= max_lignes:
-            break
-    return " ; ".join(trouvees)[:120]
+        mots_l = _mots_de(propre)
+        if mots_l and _recoupe(mots_l, reference) >= 0.6:
+            continue                                # slogan / enseigne repris de l'en-tête
+        if mots_l and any(mots_l <= v for v in vus):
+            continue                                # même ligne répétée en majuscules
+        vus.append(mots_l)
+        trouvees.append(_corriger_mots(_couper(propre, 60)))
+        if _OBJET_FORT.search(propre) or len(trouvees) >= max_lignes:
+            break                                   # une ligne qui décrit l'objet suffit
+    return " ; ".join(trouvees)[:130]
 
 
 def find_invoice_number(text: str) -> str:
@@ -1162,7 +1253,8 @@ def extraire_champs(lecture: dict | None = None, texte: str = "") -> dict:
         entete = lecture.get("entete") or []
     else:
         fiables, entete = None, []
-    return {"fournisseur": find_supplier(texte, fiables, entete), "objet": find_designation(texte, fiables),
+    fournisseur = find_supplier(texte, fiables, entete)
+    return {"fournisseur": fournisseur, "objet": find_designation(texte, fiables, entete, fournisseur),
             "numero": find_invoice_number(texte + "\n" + "\n".join(entete)), "paiement": find_payment(texte)}
 
 
