@@ -730,6 +730,15 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
                 except Exception:  # noqa: BLE001      l'en-tête est un plus : jamais bloquant
                     entete = []
         texte = "\n".join(morceaux)
+    if images and not engine.lower().startswith("easy") and time.time() - debut < 18 \
+            and not find_invoice_number(texte + "\n" + "\n".join(entete)):
+        try:                                        # n° de facture introuvable : on relit le haut de la page, agrandi
+            haut = images[0].crop((0, 0, images[0].size[0], max(1, int(images[0].size[1] * 0.45))))
+            if haut.size[0] < 2400:
+                haut = haut.resize((2400, int(haut.size[1] * 2400 / haut.size[0])), Image.LANCZOS)
+            entete = list(entete) + ocr_donnees(haut, psm=6)[0].splitlines()
+        except Exception:  # noqa: BLE001
+            pass
     meilleur, candidats = find_amount(texte)
     if meilleur is None and total is None and not engine.lower().startswith("easy") and time.time() - debut < 15:
         texte += "\n" + run_ocr(images, engine, psm=4)          # 2e passe seulement si la 1re a été rapide
@@ -1215,33 +1224,72 @@ def find_designation(text: str, fiables=None, entete=None, fournisseur: str = ""
     return " ; ".join(trouvees)[:130]
 
 
+_MOT_FACTURE = r"f[a4][cg]t[uv]r[eéf]?"
+_ETIQUETTE_FACTURE = r"\b(?:" + _MOT_FACTURE + r"|fact\.?|invoice|ticket|re[cç]u|avoir|pi[eè]ce|document|doc\.)"
+_EXCLUS_NUMERO = re.compile(r"tva|siret|siren|iban|\bt[eé]l|fax|rcs|capital|\bbic\b|www|@|portable|mobile")
+
+
+def _chiffres_ocr(jeton: str) -> str:
+    """Corrige les confusions de lecture d'un numéro presque entièrement numérique (O→0, I/l→1, S→5, B→8)."""
+    if jeton and sum(c.isdigit() for c in jeton) >= 0.6 * len(jeton):
+        return jeton.translate(str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "|": "1", "S": "5", "B": "8", "Z": "2"}))
+    return jeton
+
+
+def _compacter_chiffres(text: str) -> str:
+    """« 2026 0906 0335 » → « 202609060335 » (groupes de chiffres séparés par des espaces ou des points, au moins 9 chiffres)."""
+    def joindre(m):
+        return m.group(1) + re.sub(r"[ .]", "", m.group(2)) if len(re.sub(r"\D", "", m.group(0))) >= 9 else m.group(0)
+    return re.sub(r"(?<![\d,.])(\d{2,5})((?:[ .]\d{2,5}){1,4})(?![\d,])", joindre, text)
+
+
 def find_invoice_number(text: str) -> str:
-    """Numéro de facture (« FACTURE N° 202609060335 », « N° de facture : A123 », numéro sous l'en-tête...), ou chaîne vide."""
+    """
+    Numéro de facture. Essaie dans l'ordre : « FACTURE N° … » (fautes de lecture tolérées : FACTURF, N“, O pour 0, chiffres
+    séparés par des espaces), numéro sous l'en-tête d'un tableau, « N° … » près d'un mot clé, puis, à défaut d'étiquette lisible,
+    un long numéro commençant par l'année (202609060335) en haut de la page.
+    """
     def valide(jeton: str) -> bool:
         jeton = jeton.strip("-/")
         return (sum(ch.isdigit() for ch in jeton) >= 3 and norm(jeton) not in ("date", "numero", "client")
                 and not re.fullmatch(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", jeton))
+
     signe = r"(?:n\s*[°º\"“”'*®]?|num[eé]ro|#)"
-    modeles = [r"n\s*[°º\"“”'*®]?\s*(?:de\s*)?facture\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})",
-               r"(?:facture|fact\.?|invoice|ticket|re[cç]u|avoir)\s*" + signe + r"?\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{3,24})"]
-    for modele in modeles:
-        for m in re.finditer(modele, text, re.I):
-            if valide(m.group(1)):
-                return m.group(1).strip("-/")
-    lignes = text.splitlines()
-    # en-tête de tableau « N° FACTURE | DATE | CLIENT » avec les valeurs sur la ligne du dessous
-    for i, l in enumerate(lignes):
-        if re.search(r"facture|invoice", l, re.I) and re.search(r"\bdate\b", l, re.I) and not re.search(r"\d{5,}", l):
-            for suivante in lignes[i + 1:i + 3]:
-                for jeton in re.findall(r"[A-Z0-9][A-Z0-9\-/]{4,24}", suivante, re.I):
-                    if valide(jeton) and sum(ch.isdigit() for ch in jeton) >= 5:
-                        return jeton.strip("-/")
-    # dernier recours : « N° 00451 » sur une ligne qui parle de ticket / facture / caisse / commande
-    for l in lignes:
-        if re.search(r"ticket|caisse|facture|re[cç]u|commande", l, re.I):
-            m = re.search(r"n\s*[°º\"“”'*®]\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{2,24})", l, re.I)
-            if m and valide(m.group(1)):
-                return m.group(1).strip("-/")
+    jeton_re = r"([A-Z0-9][A-Z0-9\-/]{3,24})"
+    modeles = [r"n\s*[°º\"“”'*®]?\s*(?:de\s*)?" + _MOT_FACTURE + r"\s*[:#]?\s*" + jeton_re,
+               _ETIQUETTE_FACTURE + r"\s*" + signe + r"?\s*[:#]?\s*" + jeton_re,
+               _ETIQUETTE_FACTURE + r"\s*" + signe + r"?\s*[:#]?\s*\n\s*" + jeton_re]     # numéro à la ligne suivante
+    compact = _compacter_chiffres(text)
+    for variante in (compact, text):                # d'abord les chiffres regroupés : « 2026 0906 0335 » est un seul numéro
+        for modele in modeles:
+            for m in re.finditer(modele, variante, re.I):
+                j = _chiffres_ocr(m.group(1)).strip("-/")
+                if valide(j):
+                    return j
+        lignes = variante.splitlines()
+        for i, l in enumerate(lignes):             # en-tête de tableau « N° FACTURE | DATE | CLIENT », valeurs dessous
+            if re.search(r"facture|invoice", l, re.I) and re.search(r"\bdate\b", l, re.I) and not re.search(r"\d{5,}", l):
+                for suivante in lignes[i + 1:i + 3]:
+                    for jeton in re.findall(r"[A-Z0-9][A-Z0-9\-/]{4,24}", suivante, re.I):
+                        j = _chiffres_ocr(jeton)
+                        if valide(j) and sum(ch.isdigit() for ch in j) >= 5:
+                            return j.strip("-/")
+        for l in lignes:                           # « N° 00451 » sur une ligne qui parle de ticket / facture / caisse / commande
+            if re.search(r"ticket|caisse|facture|re[cç]u|commande", l, re.I):
+                m = re.search(r"n\s*[°º\"“”'*®]\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/]{2,24})", l, re.I)
+                if m and valide(_chiffres_ocr(m.group(1))):
+                    return _chiffres_ocr(m.group(1)).strip("-/")
+    # sans étiquette lisible : long numéro en haut de page (année + chiffres), hors téléphones, SIRET, TVA, IBAN
+    for l in compact.splitlines()[:20]:
+        if _EXCLUS_NUMERO.search(norm(l)):
+            continue
+        for m in re.finditer(r"(?<![\d,.])(20\d{2}\d{6,9})(?![\d,.])", l):
+            return m.group(1)
+    for l in compact.splitlines()[:20]:
+        if _EXCLUS_NUMERO.search(norm(l)):
+            continue
+        for m in re.finditer(r"(?<![\d,.])([1-9]\d{8,12})(?![\d,.])", l):
+            return m.group(1)
     return ""
 
 
