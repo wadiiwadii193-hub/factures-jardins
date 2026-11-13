@@ -739,28 +739,32 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
             entete = list(entete) + ocr_donnees(haut, psm=6)[0].splitlines()
         except Exception:  # noqa: BLE001
             pass
+    if images and not engine.lower().startswith("easy") and time.time() - debut < 20 and not triplet_tva(texte.splitlines()):
+        try:                                        # totaux non recoupés : on relit le bas de la dernière page, agrandi
+            im = images[-1]
+            bas = im.crop((0, int(im.size[1] * 0.50), im.size[0], im.size[1]))
+            if bas.size[0] < 2400:
+                bas = bas.resize((2400, int(bas.size[1] * 2400 / bas.size[0])), Image.LANCZOS)
+            texte += "\n" + ocr_donnees(bas, psm=6)[0]
+        except Exception:  # noqa: BLE001
+            pass
     meilleur, candidats = find_amount(texte)
     if meilleur is None and total is None and not engine.lower().startswith("easy") and time.time() - debut < 15:
         texte += "\n" + run_ocr(images, engine, psm=4)          # 2e passe seulement si la 1re a été rapide
         meilleur, candidats = find_amount(texte)
     somme = _total_par_somme([float(m.group(0).replace(",", ".")) for m in re.finditer(r"\d+[.,]\d{2}", texte)])
     final = total or meilleur
-    source = "libellé Net à payer / TTC" if total else "texte"
-    if final is None and mots_premiere:
-        final = find_total_bas_droite(mots_premiere)
-        source = "bas de page, à droite"
     if final is not None and somme and round(final, 2) in somme[1] and round(final, 2) != somme[0]:
         final = somme[0]                    # ex. 3,88 (TVA) ou 19,42 (HT) repéré à tort : 19,42 + 3,88 = 23,30
-        source = "HT + TVA"
-    toutes = [_to_float(m) for m in _AMOUNT.finditer(texte)]
-    corrige = _eviter_tva_et_ht(final, texte.splitlines(), toutes)   # jamais un HT ni une TVA
-    if corrige is not None and final is not None and round(corrige, 2) != round(final, 2):
-        source = "HT + TVA (corrigé)"
-    final = corrige if corrige is not None else final
+    tri = triplet_tva(texte.splitlines())
+    detail_total = ""
+    if tri:
+        final = tri[2]                              # le contrôle HT + TVA = TTC l'emporte sur toute autre lecture
+        detail_total = _texte_tri(tri)
     if final is not None:
         meilleur = final
         candidats = [final] + [c for c in candidats if c != final]
-    return {"text": texte, "amount": meilleur, "amount_source": source, "candidates": candidats[:6],
+    return {"text": texte, "amount": meilleur, "candidates": candidats[:6], "detail_total": detail_total,
             "mots": [{"t": m["t"], "c": m["c"], "l": m["l"]} for m in mots_premiere], "entete": entete}
 
 
@@ -807,86 +811,68 @@ def _total_par_somme(valeurs):
     return meilleur
 
 
-def _montants_ht_tva(lines):
-    """Montants des lignes libellées HT et TVA (jamais celles qui contiennent « TTC »)."""
+def _eviter_tva_et_ht(best, lines, every):
+    """Si le montant retenu est celui d'une ligne TVA ou HT, on remonte au TTC (HT + TVA) ou au plus gros autre montant."""
+    if best is None:
+        return best
     tva, ht = set(), set()
     for line in lines:
         n_l = norm(line)
-        if "ttc" in n_l or "payer" in n_l:
-            continue
         valeurs = {round(_to_float(m), 2) for m in _AMOUNT.finditer(line)}
-        if re.search(r"tva|t\.v\.a|taxe", n_l):
+        if re.search(r"tva|t\.v\.a|taxe", n_l) and "ttc" not in n_l:
             tva |= valeurs
-        elif re.search(r"\bht\b|hors taxe", n_l):
+        if re.search(r"\bht\b|hors taxe", n_l) and "ttc" not in n_l:
             ht |= valeurs
-    return ht, tva
+    if round(best, 2) not in tva | ht:
+        return best
+    ttc = next((c for c in sorted(every, reverse=True) if any(abs(c - (h + v)) < 0.011 for h in ht for v in tva)), None)
+    if ttc:
+        return ttc
+    if round(best, 2) in tva:
+        autres = [a for a in every if round(a, 2) not in tva | ht]
+        if autres:
+            return max(autres)
+    return best
 
 
 _TAUX_TVA = (0.20, 0.10, 0.055, 0.021)
+_LIGNE_A_IGNORER = re.compile(r"capital|siret|siren|iban|\brcs\b|\bt[eé]l\b|fax|\bbic\b")
 
 
-def _eviter_tva_et_ht(best, lines, every):
+def triplet_tva(lignes):
     """
-    Garde-fou : le champ doit être le NET À PAYER TTC, jamais un montant HT ni de TVA.
-    Règles : TTC >= HT > TVA, et HT + TVA = TTC. Si le montant retenu les viole, on le remplace par
-    HT + TVA (retrouvé dans le texte, ou reconstitué si le taux de TVA est cohérent).
+    Le contrôle le plus fiable : HT + TVA = TTC, avec un taux de TVA connu (20 %, 10 %, 5,5 %, 2,1 %).
+    Retourne (ht, tva, ttc, ttc_lu) ou None. Le TTC est calculé s'il n'a pas été lu, à condition que le HT et la TVA
+    se trouvent près d'une ligne qui parle de HT ou de TVA.
     """
-    ht, tva = _montants_ht_tva(lines)
-    tva = {v for v in tva if v > 0}
-    if not ht and not tva:
-        return best
-    every = [round(a, 2) for a in every]
-    reconstruit = None
-    for h in sorted(ht, reverse=True):
-        for v in sorted(tva, reverse=True):
-            if v >= h:
-                continue
-            dans_texte = next((c for c in sorted(every, reverse=True) if abs(c - (h + v)) < 0.011), None)
-            if dans_texte:
-                reconstruit = dans_texte
-            elif any(abs(h * t - v) <= 0.03 for t in _TAUX_TVA):
-                reconstruit = round(h + v, 2)
-            if reconstruit:
-                break
-        if reconstruit:
-            break
-    if best is None:
-        return reconstruit
-    b = round(best, 2)
-    mauvais = ((b in tva) or (tva and b in ht) or any(b < h - 0.005 for h in ht) or any(b <= v for v in tva))
-    if not mauvais:
-        return best
-    if reconstruit:
-        return reconstruit
-    plancher = max(ht | tva, default=0)
-    autres = [a for a in every if a not in ht | tva and a > plancher]
-    return max(autres) if autres else best
-
-
-def find_total_bas_droite(mots):
-    """
-    Dernier recours quand aucun libellé « Net à payer / Total TTC » n'est lu : le montant le plus BAS de la page
-    (à droite en cas d'égalité), hors lignes HT / TVA / sous-total.
-    """
-    if not mots:
-        return None
-    haut = max(m["y"] + m["h"] for m in mots)
-    lignes = {}
-    for m in mots:
-        lignes.setdefault(m["l"], []).append(m)
-    candidats = []
-    for ms in lignes.values():
-        n_l = norm(" ".join(m["t"] for m in ms))
-        if re.search(r"\b(ht|tva)\b|hors taxe|sous.?total", n_l) and "ttc" not in n_l and "payer" not in n_l:
+    valeurs = {}
+    for i, l in enumerate(lignes):
+        if _LIGNE_A_IGNORER.search(norm(l)):
             continue
-        for m in ms:
-            t = m["t"].replace("€", "").replace("EUR", "").strip()
-            mt = _AMOUNT.fullmatch(t)
-            if mt and 0 < _to_float(mt) < 100_000 and m["y"] > 0.45 * haut:
-                candidats.append((round(m["y"] / max(1, m["h"])), m["x"], _to_float(mt)))
-    if not candidats:
+        for m in _AMOUNT.finditer(l):
+            v = round(_to_float(m), 2)
+            if 0 < v < 100_000:
+                valeurs.setdefault(v, []).append(i)
+    cles = [i for i, l in enumerate(lignes) if re.search(r"\b(ht|tva)\b|hors taxe|\btaxe", norm(l))]
+    proche = lambda v: any(abs(i - k) <= 2 for i in valeurs[v] for k in cles)
+    trouves = []
+    for ht in valeurs:
+        for tva in valeurs:
+            if tva >= ht or not any(abs(tva - ht * r) <= max(0.02, 0.004 * ht) for r in _TAUX_TVA):
+                continue
+            ttc = round(ht + tva, 2)
+            lu = ttc in valeurs
+            if lu or (proche(ht) and proche(tva)):
+                trouves.append((lu, ttc, ht, tva))
+    if not trouves:
         return None
-    return max(candidats)[2]
+    lu, ttc, ht, tva = max(trouves)
+    return ht, tva, ttc, lu
+
+
+def _texte_tri(tri) -> str:
+    f = lambda v: f"{v:.2f}".replace(".", ",") + " €"
+    return f"HT {f(tri[0])} + TVA {f(tri[1])} = TTC {f(tri[2])}" + ("" if tri[3] else " (calculé)")
 
 
 def find_amount(text: str):
@@ -911,6 +897,9 @@ def find_amount(text: str):
         somme = _total_par_somme(every)
         best = somme[0] if somme else (max(every) if every else None)
     best = _eviter_tva_et_ht(best, lines, every)
+    tri = triplet_tva(lines)
+    if tri:
+        best = tri[2]                                  # HT + TVA = TTC : le Net à payer TTC, jamais le HT ni la TVA
     cands = []
     for a in ([best] if best else []) + [a for _, a in sorted(weighted, reverse=True)] + sorted(every, reverse=True):
         if a not in cands:

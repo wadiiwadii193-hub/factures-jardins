@@ -190,14 +190,17 @@ def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
         lecture = core.read_invoice(images, "Tesseract")
         texte, montant, candidats = lecture["text"], lecture["amount"], lecture["candidates"]
         champs = core.extraire_champs(lecture)
+        detail_total = lecture.get("detail_total", "")
     else:
         montant, candidats = core.find_amount(texte)
         champs = core.extraire_champs(None, texte)
+        tri = core.triplet_tva(texte.splitlines())
+        detail_total = core._texte_tri(tri) if tri else ""
     apercu = io.BytesIO()
     vignette = preview.convert("RGB")
     vignette.thumbnail((1600, 1600))
     vignette.save(apercu, "JPEG", quality=80, optimize=True)
-    return {"amount": montant, "candidates": candidats, "date": core.find_date(texte), "text": texte,
+    return {"amount": montant, "candidates": candidats, "detail_total": detail_total, "date": core.find_date(texte), "text": texte,
             "suggestion": core.suggest_category(texte, cats), "preview_jpeg": apercu.getvalue(),
             "fournisseur": champs["fournisseur"], "objet": champs["objet"], "numero": champs["numero"],
             "paiement": champs["paiement"], "floue": bool(qualite and qualite["floue"])}
@@ -283,7 +286,7 @@ def factures_recues():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 13 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 14 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -389,6 +392,8 @@ else:
         st.warning("Montant non détecté : saisissez-le.")
     if lect["date"] is None:
         st.warning("Date non détectée : choisissez-la.")
+    if lect.get("detail_total"):
+        st.caption("🧮 Montant contrôlé : " + lect["detail_total"])
     if len(lect["candidates"]) > 1:
         st.caption("Autres montants lus : " + " · ".join(eur(c) for c in lect["candidates"] if c != lect["amount"]))
 
