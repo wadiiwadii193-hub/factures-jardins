@@ -66,7 +66,7 @@ def add_entry(url: str, token: str, *, auteur: str, date_facture: str, categorie
               montant: float, source: str = "", entry_id: str | None = None,
               photo: bytes | None = None, photo_type: str = "image/jpeg",
               deja_appliquee: bool = False, fournisseur: str = "", objet: str = "",
-              numero_facture: str = "", mode_paiement: str = "") -> dict:
+              numero_facture: str = "", mode_paiement: str = "", type_saisie: str = "") -> dict:
     """Dépose une facture dans le Google Sheet (et sa photo dans le Drive si `photo` est fournie)."""
     payload = {"id": entry_id or uuid.uuid4().hex, "auteur": auteur, "date_facture": date_facture,
                "categorie": categorie, "montant": round(float(montant), 2), "source": source}
@@ -77,6 +77,8 @@ def add_entry(url: str, token: str, *, auteur: str, date_facture: str, categorie
         payload["statut"] = "appliqué"
     payload.update({"fournisseur": fournisseur, "objet": objet, "numero_facture": numero_facture,
                     "mode_paiement": mode_paiement})
+    if type_saisie:
+        payload["type"] = type_saisie                # « versement » pour un versement d'espèces
     return _call(url, token, "add", payload)
 
 
@@ -113,11 +115,17 @@ def mark_applied(url: str, token: str, ids) -> int:
     return int(_call(url, token, "mark_applied", {"ids": list(ids)}).get("updated", 0))
 
 
-def set_categories(url: str, token: str, categories) -> int:
-    return int(_call(url, token, "set_categories", {"categories": list(categories)}).get("count", 0))
+def set_categories(url: str, token: str, categories, kind: str = "sorties") -> int:
+    """kind : « sorties » (catégories de dépenses) ou « entrees » (catégories des versements)."""
+    payload = {"categories": list(categories)}
+    if kind == "entrees":
+        payload["kind"] = "entrees"
+    return int(_call(url, token, "set_categories", payload).get("count", 0))
 
 
-def get_categories(url: str, token: str) -> list[str]:
+def get_categories(url: str, token: str, kind: str = "sorties") -> list[str]:
+    if kind == "entrees":
+        return _call(url, token, "get_categories", {"kind": "entrees"})["categories"]
     return _call(url, token, "get_categories", method="GET")["categories"]
 
 

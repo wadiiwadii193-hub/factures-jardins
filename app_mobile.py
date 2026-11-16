@@ -179,6 +179,11 @@ def categories(url: str, token: str) -> list[str]:
     return cloud.get_categories(url, token)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def categories_entrees(url: str, token: str) -> list[str]:
+    return cloud.get_categories(url, token, kind="entrees")
+
+
 def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
     """Lecture automatique (montant, date, catégorie probable) + aperçu recadré. Peut être lente : jamais bloquante."""
     preview, texte, images = core.load_document(raw, nom)
@@ -221,7 +226,7 @@ def factures_recues():
     """Écran du trésorier : voir les factures reçues, les corriger, les valider ou les rejeter."""
     import pandas as pd
 
-    st.subheader("Factures reçues")
+    st.subheader("Factures et versements reçus")
     try:
         cats = categories(SCRIPT_URL, TOKEN)
         recues = cloud.list_pending(SCRIPT_URL, TOKEN)
@@ -242,19 +247,25 @@ def factures_recues():
         cle = (r["date_facture"], r["auteur"].lower(), r["categorie"].lower(), round(float(r["montant"]), 2))
         doublon = cle in vues
         vues.add(cle)
-        lignes.append({"Valider": tout and not doublon, "Date": dt.date.fromisoformat(r["date_facture"]),
+        lignes.append({"Valider": tout and not doublon, "Type": "💶 Versement" if r.get("type") == "versement" else "🧾 Facture",
+                       "Date": dt.date.fromisoformat(r["date_facture"]),
                        "Auteur": r["auteur"], "Fournisseur": r.get("fournisseur", ""), "Désignation": r.get("objet", ""),
                        "N° facture": r.get("numero_facture", ""), "Paiement": r.get("mode_paiement") or "Espèces",
                        "Catégorie": r["categorie"], "Montant (€)": float(r["montant"]),
                        "Photo": r.get("photo_url") or None,
                        "Remarque": "Doublon possible" if doublon else "", "id": r["id"]})
-    options = list(cats) + sorted({x["Catégorie"] for x in lignes if x["Catégorie"] not in cats})
+    try:
+        cats_e = categories_entrees(SCRIPT_URL, TOKEN)
+    except cloud.CloudError:
+        cats_e = []
+    options = list(cats) + [c for c in cats_e if c not in cats]
+    options += sorted({x["Catégorie"] for x in lignes if x["Catégorie"] not in options})
     edite = st.data_editor(
-        pd.DataFrame(lignes), hide_index=True, key=f"recues_{tout}", disabled=["Auteur", "Photo", "Remarque"],
+        pd.DataFrame(lignes), hide_index=True, key=f"recues_{tout}", disabled=["Type", "Auteur", "Photo", "Remarque"],
         column_config={"id": None,
                        "Date": st.column_config.DateColumn("Date", format="DD/MM/YYYY", required=True),
                        "Catégorie": st.column_config.SelectboxColumn("Catégorie", options=options, required=True),
-                       "Paiement": st.column_config.SelectboxColumn("Paiement", options=["CB", "Chèque", "Espèces"]),
+                       "Paiement": st.column_config.SelectboxColumn("Paiement", options=["CB", "Chèque", "Espèces", "Virement"]),
                        "Montant (€)": st.column_config.NumberColumn(format="%.2f", min_value=0.01),
                        "Photo": st.column_config.LinkColumn("Photo", display_text="Ouvrir")})
     cochees = edite[edite["Valider"]]
@@ -283,19 +294,122 @@ def factures_recues():
             st.rerun()
 
 
+def ecran_versement():
+    """Versement d'espèces : photo du ticket de dépôt + saisie. Le trésorier valide, puis le PC met Excel à jour."""
+    st.title("💶 Versement d'espèces")
+    st.caption("Photographiez le ticket de dépôt de la banque. Le trésorier valide : le montant va dans les entrées et le "
+               "ticket est rangé avec le versement.")
+    auteur_v = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
+    n = st.session_state.get("nv", 0)
+    st.caption("Touchez le bouton, puis choisissez « Prendre une photo » (iPhone) ou « Appareil photo » (Android).")
+    envoi_v = st.file_uploader("📷 Photo du ticket de dépôt (ou PDF)", type=["jpg", "jpeg", "png", "pdf"], key=f"envoi_v_{n}")
+    if envoi_v:
+        signature = (envoi_v.name, envoi_v.size)
+        if st.session_state.get(f"sigv_{n}") != signature:             # une seule fois par fichier
+            st.session_state[f"sigv_{n}"] = signature
+            brut = envoi_v.getvalue()
+            try:
+                brut = core.reduire_photo(brut, envoi_v.name)
+            except Exception:  # noqa: BLE001
+                pass
+            st.session_state[f"recuv_{n}"] = (brut, envoi_v.name)
+    data, name = st.session_state.get(f"recuv_{n}", (None, ""))
+    sans_ticket = st.checkbox("Je n'ai pas de ticket", key=f"sans_{n}") if data is None else False
+    if data is None and not sans_ticket:
+        st.info("Ajoutez la photo du ticket : le formulaire s'affichera aussitôt.")
+        return
+    if data:
+        st.success(f"📎 Ticket reçu ({max(1, len(data) // 1024)} Ko). Complétez le formulaire ci-dessous.")
+    try:
+        cats_e = categories_entrees(SCRIPT_URL, TOKEN)
+    except cloud.CloudError as e:
+        st.error(str(e))
+        return
+    if not cats_e:
+        st.warning("La liste des catégories n'est pas encore disponible : le trésorier doit d'abord ouvrir l'application sur son PC.")
+        return
+    fh = hashlib.md5(data).hexdigest()[:10] if data else "sans"
+    cle = f"v_{n}_{fh}"
+    cle_lect = f"lectv_{n}_{fh}"
+    entry_id = st.session_state.setdefault(f"idv_{n}_{fh}", uuid.uuid4().hex)
+    lect = st.session_state.get(cle_lect)
+    if lect and not st.session_state.get("initv_" + cle_lect):          # valeurs proposées par la lecture du ticket
+        st.session_state["initv_" + cle_lect] = True
+        if lect.get("montant_v") and not st.session_state.get(f"{cle}_montant"):
+            st.session_state[f"{cle}_montant"] = float(lect["montant_v"])
+        if lect.get("date"):
+            st.session_state[f"{cle}_date"] = lect["date"]
+    st.session_state.setdefault(f"{cle}_montant", 0.0)
+    st.session_state.setdefault(f"{cle}_date", dt.date.today())
+    st.session_state.setdefault(f"{cle}_mode", "Espèces")
+    if data:
+        if lect and lect.get("preview_jpeg"):
+            st.image(lect["preview_jpeg"], caption="Ticket de dépôt")
+        elif name.lower().endswith(".pdf") or data[:5] == b"%PDF-":
+            st.caption("📄 Document PDF reçu.")
+        else:
+            st.image(data, caption="Ticket reçu")
+        if lect is None:
+            st.caption("⏳ Lecture automatique du montant et de la date en cours… Vous pouvez déjà remplir le formulaire.")
+        elif lect.get("erreur"):
+            st.warning("Lecture automatique impossible : saisissez la date et le montant.")
+    date_in = st.date_input("Date du versement", format="DD/MM/YYYY", key=f"{cle}_date")
+    cat = st.selectbox("Catégorie (ex. Vente fumier)", cats_e, index=None, placeholder="Choisir une catégorie…", key=f"{cle}_cat")
+    montant = st.number_input("Montant déposé (€)", min_value=0.0, step=0.01, format="%.2f", key=f"{cle}_montant")
+    mode = st.selectbox("Mode", ["Espèces", "CB", "Virement", "Chèque"], key=f"{cle}_mode")
+    precision = st.text_input("Précision (facultatif, ex. nom de l'acheteur)", key=f"{cle}_prec")
+    if cat:
+        st.info(f"➡️ **{cat}** · **{MOIS[date_in.month - 1]} {date_in.year}** · **{eur(montant)}**")
+    ready = bool(auteur_v.strip()) and bool(cat) and montant > 0
+    if not auteur_v.strip():
+        st.caption("Indiquez votre prénom pour pouvoir envoyer.")
+    if st.button("📤 Envoyer le versement au trésorier", type="primary", disabled=not ready, key=f"{cle}_envoi"):
+        try:
+            photo, photo_type = photo_a_envoyer(data, name, lect) if data else (None, "image/jpeg")
+            res = cloud.add_entry(SCRIPT_URL, TOKEN, auteur=auteur_v.strip(), date_facture=date_in.isoformat(), categorie=cat,
+                                  montant=montant, source="mobile:versement", entry_id=entry_id, photo=photo,
+                                  photo_type=photo_type, fournisseur="", objet=precision.strip(), mode_paiement=mode,
+                                  type_saisie="versement")
+        except cloud.CloudError as e:
+            st.error(f"Envoi impossible : {e}")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Envoi impossible ({type(e).__name__}) : {e}")
+        else:
+            envoye = core.maintenant_fr()
+            msg = (f"✅ Versement envoyé le {envoye:%d/%m/%Y} à {envoye:%H:%M:%S} : {eur(montant)} · {cat} · "
+                   f"{MOIS[date_in.month - 1]}. Merci !")
+            if res.get("photo_erreur"):
+                msg += " (Le versement est bien enregistré, mais la photo du ticket n'a pas pu être conservée.)"
+            st.session_state["message"] = msg
+            st.session_state["nv"] = n + 1
+            st.rerun()
+    if data and lect is None:                       # lecture du ticket en DERNIER : ne bloque jamais l'envoi
+        try:
+            with st.spinner("Lecture automatique du ticket…"):
+                lect = lire_facture(data, name, True, [])
+            lect["montant_v"] = core.find_amount_versement(lect.get("text", ""))[0]
+        except Exception as e:  # noqa: BLE001
+            lect = {"erreur": f"{type(e).__name__}"}
+        st.session_state[cle_lect] = lect
+        st.rerun()
+
+
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 14 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 15 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
     st.success(st.session_state.pop("message"))
-if est_tresorier:
-    vue = st.radio("Que voulez-vous faire ?", ["🧾 Envoyer une facture", "📥 Factures reçues"], horizontal=True)
-    if vue.startswith("📥"):
-        factures_recues()
-        st.stop()
+_choix_vue = ["🧾 Envoyer une facture", "💶 Envoyer un versement d'espèces"] + (["📥 Factures reçues"] if est_tresorier else [])
+vue = st.radio("Que voulez-vous faire ?", _choix_vue)
+if vue.startswith("📥"):
+    factures_recues()
+    st.stop()
+if vue.startswith("💶"):
+    ecran_versement()
+    st.stop()
 
 st.title("🧾 Nouvelle facture")
 st.caption("Dépense du jardin : la facture est envoyée au trésorier, qui la reporte dans le tableau.")

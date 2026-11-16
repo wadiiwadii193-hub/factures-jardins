@@ -300,7 +300,7 @@ def _copy_row_style(ws, lay: Layout, src_row: int, dst_row: int):
 
 def record_amount(path, sheet: str, which: str, month: int, amount: float, *,
                   label: str | None = None, new_label: str | None = None,
-                  make_backup: bool = True, detail: dict | None = None) -> dict:
+                  make_backup: bool = True, detail: dict | None = None, versement: dict | None = None) -> dict:
     """
     Ajoute `amount` dans (catégorie × mois) du bloc `which` ('sorties' ou 'entrees').
     `new_label` crée la catégorie dans la première ligne libre du bloc.
@@ -339,13 +339,15 @@ def record_amount(path, sheet: str, which: str, month: int, amount: float, *,
     cell = ws.cell(row, col)
     old, new = add_amount(cell, amount)
     detail_res = ecrire_detail(ws, lay, detail) if detail else None
+    versement_res = ecrire_versement(ws, lay, versement) if versement else None
     if make_backup:
         backup = save_with_backup(wb, path)
     else:                     # lot de plusieurs lignes : une seule sauvegarde pour tout le lot
         wb.save(path)
         backup = None
     return {"row": row, "col": col, "cell": cell.coordinate, "old": old, "new": new,
-            "label": str(ws.cell(row, lay.label_col).value).strip(), "backup": backup, "detail": detail_res}
+            "label": str(ws.cell(row, lay.label_col).value).strip(), "backup": backup, "detail": detail_res,
+            "versement": versement_res}
 
 
 def log_operation(path, **fields):
@@ -915,6 +917,21 @@ _D_TXT = re.compile(r"(?<!\d)(\d{1,2})(?:er)?\s+(janv|jan|fevr|fev|mars|avr|mai|
                     r"[a-z]*\.?\s+(\d{4}|\d{2})(?!\d)")
 
 
+def find_amount_versement(text: str):
+    """Montant d'un ticket de dépôt d'espèces : la ligne « montant / dépôt / versement », sans le solde ni les frais."""
+    candidats = []
+    for ligne in text.splitlines():
+        n = norm(ligne)
+        if re.search(r"solde|disponible|plafond|frais|commission", n):
+            continue
+        valeurs = [round(_to_float(m), 2) for m in _AMOUNT.finditer(ligne)]
+        if valeurs and re.search(r"montant|depot|depose|versement|verse|remise|espece|credit|encaiss|total", n):
+            candidats += valeurs
+    if candidats:
+        return candidats[0], list(dict.fromkeys(candidats))
+    return find_amount(text)
+
+
 def find_date(text: str, today: dt.date | None = None) -> dt.date | None:
     today = today or dt.date.today()
     best, best_score = None, None
@@ -1101,12 +1118,13 @@ def ecrire_detail(ws, lay: Layout, d: dict):
         except AttributeError:          # cellule fusionnée : on la laisse
             pass
 
-    poser("fournisseur", d.get("fournisseur"))
+    poser("fournisseur", " ".join(str(d.get("fournisseur") or "").split()))     # espaces nettoyés : « Leroy  Merlin » = « Leroy Merlin »
     poser("objet", d.get("objet"))
     poser("facture", d.get("facture"))
     poser("date", d.get("date"), "DD/MM/YYYY")
     poser("paiement", d.get("paiement"))
     poser("montant", round(float(d["montant"]), 2) if d.get("montant") is not None else None, '#,##0.00 "€"')
+    ajouter_regle_fournisseurs(ws, entete, cols)
     cell_just = None
     if "justificatif" in cols and d.get("justificatif_lien"):
         cell = ws.cell(r, cols["justificatif"])
@@ -1397,3 +1415,484 @@ def nom_fichier_sur(*morceaux, max_len: int = 70) -> str:
     brut = "_".join(norm(m) for m in morceaux if m)
     brut = re.sub(r"[^a-z0-9]+", "-", brut).strip("-")
     return brut[:max_len] or "justificatif"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  TABLEAU « SUIVI DES VERSEMENTS D'ESPÈCES (BANQUE) » : Date · Désignation · Montant · Justificatif
+# ════════════════════════════════════════════════════════════════════════════
+def trouver_tableau_versements(ws, lay: Layout):
+    """(ligne d'en-tête, {rôle: colonne}) du tableau des versements d'espèces, repéré par son titre, ou None."""
+    fin = min(ws.max_row, lay.sorties.total_row + 80)
+    largeur = min(ws.max_column, 30)
+    for r in range(lay.sorties.total_row + 1, fin + 1):
+        for c in range(1, largeur + 1):
+            n = norm(ws.cell(r, c).value)
+            if "versement" not in n or "espece" not in n:
+                continue
+            for rh in (r + 1, r + 2):                                   # en-têtes sous le titre
+                cols = {}
+                for cc in range(max(1, c - 1), min(largeur, c + 8) + 1):
+                    n2 = norm(ws.cell(rh, cc).value)
+                    if n2.startswith("date"):
+                        cols.setdefault("date", cc)
+                    elif "designation" in n2 or "objet" in n2:
+                        cols.setdefault("designation", cc)
+                    elif "montant" in n2:
+                        cols.setdefault("montant", cc)
+                    elif "justificatif" in n2:
+                        cols.setdefault("justificatif", cc)
+                if {"date", "montant"} <= set(cols):
+                    return rh, cols
+    return None
+
+
+def ecrire_versement(ws, lay: Layout, d: dict):
+    """
+    Ajoute un versement (première ligne libre du tableau des versements d'espèces).
+    d : date (datetime.date), designation, montant, justificatif_lien. Retourne {"ligne": n, "cellule_justificatif": ...} ou None.
+    """
+    from copy import copy as _copy
+    from openpyxl.styles import Font
+
+    trouve = trouver_tableau_versements(ws, lay)
+    if not trouve:
+        return None
+    entete, cols = trouve
+    cles = [cols[k] for k in ("date", "designation", "montant") if k in cols]
+    r = entete + 1
+    while r < entete + 800 and any(ws.cell(r, c).value not in (None, "") for c in cles):
+        r += 1
+    if r > entete + 1 and ws.cell(r, min(cols.values())).border.left.style is None:
+        for c in cols.values():
+            ws.cell(r, c)._style = _copy(ws.cell(r - 1, c)._style)
+
+    def poser(role, valeur, format_=None):
+        if role not in cols or valeur in (None, ""):
+            return
+        cell = ws.cell(r, cols[role])
+        try:
+            avant = cell.number_format
+            cell.value = valeur
+            if format_ and avant == "General":
+                cell.number_format = format_
+        except AttributeError:
+            pass
+
+    poser("date", d.get("date"), "DD/MM/YYYY")
+    poser("designation", " ".join(str(d.get("designation") or "").split()))
+    poser("montant", round(float(d["montant"]), 2) if d.get("montant") is not None else None, '#,##0.00 "€"')
+    cell_just = None
+    if "justificatif" in cols and d.get("justificatif_lien"):
+        cell = ws.cell(r, cols["justificatif"])
+        try:
+            cell.value = "📄 PDF"
+            cell.hyperlink = d["justificatif_lien"]
+            cell.font = Font(color="0563C1", underline="single")
+            cell_just = cell.coordinate
+        except AttributeError:
+            pass
+    return {"ligne": r, "cellule_justificatif": cell_just}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  COULEUR DES FOURNISSEURS RÉCURRENTS (règle de mise en forme dynamique d'Excel)
+# ════════════════════════════════════════════════════════════════════════════
+COULEUR_FOURNISSEUR_RECURRENT = "E3F4EC"        # vert d'eau très clair (jaune très léger : « FFF9DB »)
+LIGNES_REGLE_FOURNISSEURS = 400
+
+
+def ajouter_regle_fournisseurs(ws, entete: int, cols: dict) -> bool:
+    """
+    Colore (teinte pastel) toute ligne du tableau du bas dont le fournisseur apparaît 2 fois ou plus.
+    C'est une règle de mise en forme conditionnelle d'Excel : elle se met à jour toute seule, même pour les lignes
+    saisies à la main. Retourne True si la règle vient d'être ajoutée, False si elle existait déjà.
+    """
+    from openpyxl.formatting.rule import FormulaRule
+    from openpyxl.styles import PatternFill
+    from openpyxl.utils import get_column_letter as lettre
+
+    premiere, derniere = entete + 1, entete + LIGNES_REGLE_FOURNISSEURS
+    col = lettre(cols["fournisseur"])
+    plage = f"{lettre(min(cols.values()))}{premiere}:{lettre(max(cols.values()))}{derniere}"
+    formule = f'AND(${col}{premiere}<>"",COUNTIF(${col}${premiere}:${col}${derniere},${col}{premiere})>=2)'
+    for cf in ws.conditional_formatting:
+        for regle in cf.rules:
+            if regle.formula and formule in regle.formula:
+                return False
+    fond = PatternFill(start_color="FF" + COULEUR_FOURNISSEUR_RECURRENT, end_color="FF" + COULEUR_FOURNISSEUR_RECURRENT, fill_type="solid")
+    ws.conditional_formatting.add(plage, FormulaRule(formula=[formule], fill=fond))
+    return True
+
+
+def appliquer_regle_fournisseurs(path, sheet: str) -> dict:
+    """Ajoute la règle de couleur au fichier Excel (copie de sécurité avant écriture)."""
+    import openpyxl
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb[sheet]
+    trouve = trouver_tableau_detail(ws, detect_layout(ws))
+    if not trouve:
+        return {"ok": False, "message": "Le tableau du bas (Fournisseur & Détail de l'achat) est introuvable dans cette feuille."}
+    ajoutee = ajouter_regle_fournisseurs(ws, trouve[0], trouve[1])
+    if ajoutee:
+        save_with_backup(wb, path)
+    return {"ok": True, "ajoutee": ajoutee}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  RAPPORT DE SYNTHÈSE (réunions de l'association)
+# ════════════════════════════════════════════════════════════════════════════
+CORE_VERSION = 27                                  # doit correspondre à VERSION_PC de app.py
+NB = "\u00a0"                                    # espace insécable
+LARGEUR_RAPPORT = 76                              # largeur des lignes du rapport (retour à la ligne maîtrisé)
+
+
+def _eur(v: float) -> str:
+    return f"{v:,.2f}".replace(",", NB).replace(".", ",") + NB + "€"
+
+
+def _bloc(items, retrait: int) -> list:
+    """Détail entre parenthèses : coupé entre deux éléments, chaque ligne suivante alignée sous la première."""
+    import textwrap
+    corps = " ".join(it.replace(" ", NB) + (NB + "•" if k < len(items) - 1 else "") for k, it in enumerate(items))
+    return textwrap.wrap("(" + corps + ")", width=LARGEUR_RAPPORT, initial_indent=" " * retrait,
+                         subsequent_indent=" " * (retrait + 1), break_long_words=False, break_on_hyphens=False)
+
+
+def _replier(texte: str, suite: int = 4) -> list:
+    """Ligne longue : les lignes suivantes sont décalées de `suite` espaces (jamais ramenées tout à gauche)."""
+    import textwrap
+    return textwrap.wrap(texte, width=LARGEUR_RAPPORT, subsequent_indent=" " * suite,
+                         break_long_words=False, break_on_hyphens=False)
+
+
+def _date_cellule(v):
+    if isinstance(v, dt.datetime):
+        return v.date()
+    if isinstance(v, dt.date):
+        return v
+    return find_date(str(v)) if v else None
+
+
+def periode_predefinie(choix: str, annee: int, aujourdhui: dt.date | None = None):
+    """(début, fin) pour « Depuis le 1er janvier », « 4 derniers mois », « 6 derniers mois »."""
+    auj = aujourdhui or dt.date.today()
+    fin = min(auj, dt.date(annee, 12, 31)) if auj.year >= annee else dt.date(annee, 1, 1)
+    nb = {"4": 4, "6": 6}.get(choix[:1])
+    if nb:
+        mois = fin.month - (nb - 1)
+        debut = dt.date(annee, max(mois, 1), 1)
+    else:
+        debut = dt.date(annee, 1, 1)
+    return debut, fin
+
+
+def lire_versements(ws, lay, debut: dt.date, fin: dt.date) -> list:
+    """Lignes du « Tableau de suivi des versements d'espèces » dont la date est dans la période."""
+    trouve = trouver_tableau_versements(ws, lay)
+    if not trouve:
+        return []
+    entete, cols = trouve
+    sortie, vides = [], 0
+    for r in range(entete + 1, entete + 801):
+        v = {k: ws.cell(r, c).value for k, c in cols.items()}
+        if all(v.get(k) in (None, "") for k in ("date", "designation", "montant")):
+            vides += 1
+            if vides >= 3:
+                break
+            continue
+        vides = 0
+        d = _date_cellule(v.get("date"))
+        if d is None or not (debut <= d <= fin):
+            continue
+        sortie.append({"date": d, "designation": " ".join(str(v.get("designation") or "").split()),
+                       "montant": round(num(v.get("montant")), 2)})
+    return sorted(sortie, key=lambda x: x["date"])
+
+
+def construire_rapport(model, debut: dt.date, fin: dt.date, annee: int) -> dict:
+    """
+    Calcule, d'après le grand tableau : solde de départ, entrées, sorties poste par poste (mois par mois),
+    solde final, et la liste des factures du tableau du bas dont la date est dans la période.
+    Le grand tableau est mensuel : un mois entamé est compté en entier.
+    """
+    lay = model.layout
+    mois_noms = [m.capitalize() for m in MOIS_FR]
+    m_debut = 1 if debut.year < annee else (debut.month if debut.year == annee else 13)
+    m_fin = 12 if fin.year > annee else (fin.month if fin.year == annee else 0)
+    if m_debut > m_fin:
+        return {"vide": True, "debut": debut, "fin": fin, "annee": annee}
+    mois = list(range(m_debut, m_fin + 1))
+    noms = [mois_noms[m - 1] for m in mois]
+    avant = ([model.month_headers[0]] if lay.start_col else []) + [mois_noms[m - 1] for m in range(1, m_debut)]
+    ent, sor = model.entrees_df, model.sorties_df
+    treso_avant = float(ent[avant].sum().sum() - sor[avant].sum().sum()) if avant else 0.0
+
+    def postes(df, reporte=False):
+        res, reporte_total = [], 0.0
+        for libelle, ligne in df[noms].iterrows():
+            parts = [(n, float(ligne[n])) for n in sorted(noms, key=mois_noms.index) if abs(float(ligne[n])) > 0.004]
+            if not parts:
+                continue
+            if reporte and norm(libelle).startswith("sold"):
+                reporte_total += sum(v for _, v in parts)          # « Solds » : solde reporté, pas une recette
+                continue
+            res.append({"libelle": libelle, "parts": parts, "total": round(sum(v for _, v in parts), 2)})
+        return res, round(reporte_total, 2)
+
+    entrees, reporte = postes(ent, reporte=True)
+    sorties, _ = postes(sor)
+    total_e = round(sum(p["total"] for p in entrees), 2)
+    total_s = round(sum(p["total"] for p in sorties), 2)
+    depart = round(treso_avant + reporte, 2)
+
+    factures, vides = [], 0
+    trouve = trouver_tableau_detail(model.ws, lay)
+    if trouve:
+        entete, cols, _ = trouve
+        for r in range(entete + 1, entete + 801):
+            v = {k: model.ws.cell(r, c).value for k, c in cols.items()}
+            if all(v.get(k) in (None, "") for k in ("fournisseur", "objet", "facture", "date", "paiement", "montant")):
+                vides += 1
+                if vides >= 3:
+                    break
+                continue
+            vides = 0
+            d = _date_cellule(v.get("date"))
+            if d is None or not (debut <= d <= fin):
+                continue
+            factures.append({"date": d, "fournisseur": " ".join(str(v.get("fournisseur") or "").split()),
+                             "objet": " ".join(str(v.get("objet") or "").split()), "facture": str(v.get("facture") or "").strip(),
+                             "paiement": str(v.get("paiement") or "").strip(), "montant": round(num(v.get("montant")), 2)})
+        factures.sort(key=lambda f: f["date"])
+    par_fournisseur = {}
+    for f in factures:
+        if f["fournisseur"]:
+            c = par_fournisseur.setdefault(norm(f["fournisseur"]), {"nom": f["fournisseur"], "n": 0, "total": 0.0})
+            c["n"] += 1
+            c["total"] = round(c["total"] + f["montant"], 2)
+    par_paiement = {}
+    for f in factures:
+        cle = f["paiement"] or "Non précisé"
+        par_paiement[cle] = round(par_paiement.get(cle, 0.0) + f["montant"], 2)
+    return {"vide": False, "debut": debut, "fin": fin, "annee": annee, "mois": noms, "depart": depart, "reporte": reporte,
+            "entrees": entrees, "total_entrees": total_e, "sorties": sorties, "total_sorties": total_s,
+            "solde": round(depart + total_e - total_s, 2), "factures": factures,
+            "recurrents": sorted((c for c in par_fournisseur.values() if c["n"] >= 2), key=lambda c: -c["total"]),
+            "par_paiement": par_paiement, "detail_trouve": bool(trouve),
+            "versements": lire_versements(model.ws, lay, debut, fin)}
+
+
+POSTES_MENSUALITES = ("tenue de compte",)       # une seule ligne globale, avec ses mensualités (« février à décembre : … par mois »)
+POSTES_CUMULES = ("carte bancaire",)            # une seule ligne : le montant cumulé de la période, sans détail par mois
+POSTES_REGROUPES = POSTES_MENSUALITES + POSTES_CUMULES
+
+
+def _est_regroupe(libelle: str) -> bool:
+    return any(m in norm(libelle) for m in POSTES_REGROUPES)
+
+
+def _est_cumule(libelle: str) -> bool:
+    return any(m in norm(libelle) for m in POSTES_CUMULES)
+
+
+def _items_mensualites(parts) -> list:
+    """[(Janvier, 5.15), (Février, 5.25), …] → ["janvier : 5,15 €", "février à décembre : 5,25 € par mois"]."""
+    ordre = sorted(parts, key=lambda x: MOIS_FR.index(x[0].lower()))
+    series, courante = [], []
+    for nom, v in ordre:
+        i = MOIS_FR.index(nom.lower())
+        if courante and round(v, 2) == round(courante[-1][1], 2) and i == courante[-1][2] + 1:
+            courante.append((nom, v, i))
+        else:
+            if courante:
+                series.append(courante)
+            courante = [(nom, v, i)]
+    if courante:
+        series.append(courante)
+    morceaux = []
+    for s in series:
+        a, b = s[0][0].lower(), s[-1][0].lower()
+        if len(s) == 1:
+            morceaux.append(f"{a} : {_eur(s[0][1])}")
+        elif len(s) == 2:
+            morceaux.append(f"{a} et {b} : {_eur(s[0][1])} par mois")
+        else:
+            morceaux.append(f"{a} à {b} : {_eur(s[0][1])} par mois")
+    return morceaux
+
+
+def _phrase_mensualites(parts) -> str:
+    return " • ".join(_items_mensualites(parts))
+
+
+def texte_rapport(r: dict, titre: str = "Jardins familiaux", maintenant: dt.datetime | None = None,
+                  vue_sorties: str = "chrono", tri_postes: str = "montant") -> str:
+    """
+    Rapport en texte clair, prêt à être lu ou copié dans un compte rendu.
+    vue_sorties : "chrono" (les mois se déroulent ; chaque poste apparaît à son 1er paiement avec son total, et le détail
+                  de ses mois juste dessous), "poste" (un poste = une ligne) ou "mois" (montant de chaque mois).
+    tri_postes  : "montant" (du plus gros au plus petit) ou "tableau" (dans l'ordre du tableau Excel).
+    """
+    maintenant = maintenant or maintenant_fr()
+    d = lambda x: x.strftime("%d/%m/%Y")
+    if r.get("vide"):
+        return f"Aucun mois du {d(r['debut'])} au {d(r['fin'])} dans le tableau {r['annee']}."
+    fin_mois = (dt.date(r["annee"], 12, 31) if r["mois"][-1] == "Décembre"
+                else dt.date(r["annee"], MOIS_FR.index(r["mois"][-1].lower()) + 2, 1) - dt.timedelta(days=1))
+    sep = "═" * 62
+    dispo = round(r["depart"] + r["total_entrees"], 2)
+    ligne = lambda libelle, v: f"{libelle} " + "." * max(2, 30 - len(libelle)) + f" {_eur(v):>14}"
+    centre = lambda s: s.center(LARGEUR_RAPPORT).rstrip()
+    L = [centre(f"RAPPORT DU TRÉSORIER – {titre.upper()} {r['annee']}"), "",
+         centre(f"Période : du {d(r['debut'])} au {d(r['fin'])}"),
+         centre(f"(mois comptés : {r['mois'][0].lower()} à {r['mois'][-1].lower()} {r['annee']}) — Édité le {d(maintenant)}"), "",
+         "1. EN BREF", "─" * 62,
+         ligne("Solde de départ", r["depart"]),
+         ligne("Entrées de la période", r["total_entrees"]),
+         ligne("Total des disponibilités", dispo),
+         ligne("Sorties de la période", r["total_sorties"]),
+         ligne("SOLDE DE TRÉSORERIE FINAL", r["solde"]),
+         f"(au {d(fin_mois)}, calculé d'après le grand tableau)", "",
+         "2. ENTRÉES", "─" * 62]
+    if r["reporte"]:
+        L += _replier(f"(Solde reporté de l'année précédente : {_eur(r['reporte'])}, compté dans le solde de départ)", 1)
+    for p in r["entrees"]:
+        L += _replier(f"• {p['libelle']} : {_eur(p['total'])}" + (f"   [{' · '.join(f'{m.lower()} {_eur(v)}' for m, v in p['parts'])}]" if len(p["parts"]) > 1 else f"   [{p['parts'][0][0].lower()}]"), 6)
+    if not r["entrees"]:
+        L.append("(aucune entrée sur la période)")
+    L += [f"TOTAL DES ENTRÉES : {_eur(r['total_entrees'])}"]
+    if r.get("versements"):                         # versements d'espèces à la banque (tableau de suivi), avec leur date exacte
+        L += ["", "Versements d'espèces à la banque (tableau de suivi) :"]
+        for v in r["versements"]:
+            L += _replier(f"• {v['date']:%d/%m/%Y} · {v['designation']} : {_eur(v['montant'])}", 4)
+        L.append(f"TOTAL DES VERSEMENTS : {_eur(sum(v['montant'] for v in r['versements']))}  ({len(r['versements'])} versement(s))")
+    L.append("")
+    if vue_sorties == "mois":
+        L += ["3. SORTIES (DÉPENSES), MOIS PAR MOIS", "─" * 62]
+        par_mois = {}                                   # chaque mois une seule fois, avec ses dépenses
+        regroupes = [p for p in r["sorties"] if _est_regroupe(p["libelle"])]
+        for p in r["sorties"]:
+            if _est_regroupe(p["libelle"]):
+                continue                                # les frais récurrents sont regroupés plus bas
+            for mois_nom, v in p["parts"]:
+                par_mois.setdefault(mois_nom, []).append((p["libelle"], v))
+        for mois_nom in sorted(par_mois, key=lambda m: MOIS_FR.index(m.lower())):
+            depenses = sorted(par_mois[mois_nom], key=lambda x: -x[1])
+            L.append(f"• {mois_nom.upper()} {r['annee']}")
+            for libelle, v in depenses:
+                L.append(f"      – {libelle} : {_eur(v)}")
+            L.append(f"      Total {mois_nom.lower()} : {_eur(sum(v for _, v in depenses))}")
+            L.append("")
+        if not r["sorties"]:
+            L.append("(aucune dépense sur la période)")
+        if regroupes:
+            L += ["• FRAIS BANCAIRES ET RÉCURRENTS", "      (regroupés ici, non repris dans les totaux mensuels ci-dessus)"]
+            for p in regroupes:
+                if _est_cumule(p["libelle"]):
+                    L.append(f"      – {p['libelle']} : {_eur(p['total'])} (montant cumulé sur la période)")
+                else:
+                    L.append(f"      – {p['libelle']} (Total : {_eur(p['total'])}) :")
+                    L += _bloc(_items_mensualites(p["parts"]), 10)
+            L.append("")
+            detail_mois = round(sum(v for liste in par_mois.values() for _, v in liste), 2)
+            L += _replier(f"Dépenses détaillées par mois : {_eur(detail_mois)} · Frais bancaires et récurrents : {_eur(sum(p['total'] for p in regroupes))}", 4)
+    elif vue_sorties == "poste":
+        L += ["3. SORTIES (DÉPENSES), POSTE PAR POSTE", "─" * 62]
+        postes_tries = sorted(r["sorties"], key=lambda p: -p["total"]) if tri_postes == "montant" else list(r["sorties"])
+        for p in postes_tries:                      # chaque poste une seule fois : total de la période, puis le détail des mois
+            tete = f"• {p['libelle']} : {_eur(p['total'])}"
+            if len(p["parts"]) == 1:
+                L.append(f"{tete} ({p['parts'][0][0].lower()})")
+            elif _est_cumule(p["libelle"]):
+                L.append(f"{tete} (cumulé sur la période)")
+            else:
+                items = _items_mensualites(p["parts"]) if _est_regroupe(p["libelle"]) else [f"{m.lower()} : {_eur(v)}" for m, v in p["parts"]]
+                une_ligne = f"{tete} (" + " • ".join(items) + ")"
+                if len(une_ligne) <= LARGEUR_RAPPORT:
+                    L.append(une_ligne)
+                else:                               # détail long : sous la ligne principale, bien aligné
+                    L.append(tete)
+                    L += _bloc(items, 6)
+        if not r["sorties"]:
+            L.append("(aucune dépense sur la période)")
+    else:
+        L += ["3. SORTIES (DÉPENSES), DANS L'ORDRE DES MOIS", "─" * 62]
+        par_premier = {}                            # chaque poste apparaît une seule fois, au mois de son premier paiement
+        for p in r["sorties"]:
+            par_premier.setdefault(p["parts"][0][0], []).append(p)
+        for mois_nom in sorted(par_premier, key=lambda m: MOIS_FR.index(m.lower())):
+            L.append(f"• {mois_nom.upper()} {r['annee']}")
+            for p in sorted(par_premier[mois_nom], key=lambda p: -p["total"]):
+                if _est_cumule(p["libelle"]) and len(p["parts"]) > 1:
+                    L.append(f"      – {p['libelle']} : {_eur(p['total'])} (cumul de la période)")
+                else:
+                    L.append(f"      – {p['libelle']} : {_eur(p['total'])}")
+                    if len(p["parts"]) > 1:        # payé en plusieurs fois : total sur la ligne, détail des mois dessous
+                        L += _bloc(_items_mensualites(p["parts"]), 10)
+            L.append("")
+        if not r["sorties"]:
+            L.append("(aucune dépense sur la période)")
+    L += [f"TOTAL DES SORTIES : {_eur(r['total_sorties'])}", ""]
+    L += ["4. FACTURES ENREGISTRÉES (tableau de détail)", "─" * 62]
+    if not r["detail_trouve"]:
+        L.append("(tableau « Fournisseur & Détail de l'achat » introuvable dans la feuille)")
+    elif not r["factures"]:
+        L.append("(aucune facture détaillée sur la période)")
+    for f in r["factures"]:
+        morceaux = [f["date"].strftime("%d/%m/%Y"), f["fournisseur"] or "fournisseur non précisé", f["objet"]]
+        if f["facture"]:
+            morceaux.append(f"n° {f['facture']}")
+        if f["paiement"]:
+            morceaux.append(f["paiement"])
+        L += _replier("• " + " · ".join(x for x in morceaux if x) + f" : {_eur(f['montant'])}", 4)
+    if r["factures"]:
+        L.append(f"TOTAL DES FACTURES DÉTAILLÉES : {_eur(sum(f['montant'] for f in r['factures']))}  ({len(r['factures'])} facture(s))")
+        L += _replier("Par mode de paiement : " + " · ".join(f"{k} {_eur(v)}" for k, v in sorted(r["par_paiement"].items())), 4)
+    if r["recurrents"]:
+        L += _replier("Fournisseurs récurrents : " + " · ".join(f"{c['nom']} ({c['n']} factures, {_eur(c['total'])})" for c in r["recurrents"]), 4)
+    L += ["", "5. SOLDE FINAL", "─" * 62,
+          f"{_eur(r['depart'])} (départ) + {_eur(r['total_entrees'])} (entrées) = {_eur(dispo)} (disponibilités)",
+          f"{_eur(dispo)} (disponibilités) − {_eur(r['total_sorties'])} (sorties)",
+          f"= SOLDE DE TRÉSORERIE FINAL : {_eur(r['solde'])}", sep]
+    return "\n".join(L)
+
+
+POSTES_SURLIGNES = ("perte exceptionnel",)       # seuls ces postes ont leur montant surligné en jaune (« Perte exceptionnel(le) »)
+
+
+def html_rapport(texte: str, page: bool = True) -> str:
+    """
+    Version mise en forme du rapport : le MONTANT des pertes exceptionnelles est surligné en jaune pour les faire ressortir
+    (rien d'autre n'est coloré). Le fichier .html s'ouvre dans le navigateur ou dans Word.
+    """
+    import html as h
+
+    jaune = 'style="background-color:#FFF176;padding:0 3px;border-radius:3px"'
+    lignes = texte.split("\n")
+    en_tete = ""
+    if lignes and lignes[0].strip().startswith("RAPPORT DU TRÉSORIER"):          # grand titre centré + période dessous
+        titre_txt, sous, j = lignes[0].strip(), [], 1
+        while j < len(lignes) and not lignes[j].strip():
+            j += 1
+        while j < len(lignes) and lignes[j].strip():
+            sous.append(lignes[j].strip())
+            j += 1
+        lignes = lignes[j:]
+        en_tete = ('<h1 style="font-family:Arial,Helvetica,sans-serif;text-align:center;font-weight:bold;white-space:nowrap;'
+                   'margin:10px 3% 6px 3%;font-size:20px;font-size:clamp(12px,3.3vw,40px)">' + h.escape(titre_txt) + "</h1>"
+                   '<p style="font-family:Arial,Helvetica,sans-serif;text-align:center;font-size:14px;margin:0 3% 18px 3%;'
+                   'line-height:1.6">' + "<br>".join(h.escape(s) for s in sous) + "</p>")
+    sortie = []
+    for l in lignes:
+        m = re.match(r"^(\s*[–•] )(.+?)( : )(\d[\d\u00a0]*,\d{2}\u00a0€)(.*)$", l)
+        if m and any(p in norm(m.group(2)) for p in POSTES_SURLIGNES):
+            sortie.append(h.escape(m.group(1) + m.group(2) + m.group(3)) + f"<span {jaune}>{h.escape(m.group(4))}</span>" + h.escape(m.group(5)))
+        else:
+            sortie.append(h.escape(l))
+    pre = en_tete + ("<pre style=\"font-family:Consolas,'Courier New',monospace;font-size:13px;line-height:1.5;"
+                     "white-space:pre;margin:0\">" + "\n".join(sortie) + "</pre>")
+    if not page:
+        return pre
+    return ('<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>Rapport du trésorier</title></head>'
+            f'<body style="margin:24px">{pre}</body></html>')
