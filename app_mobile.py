@@ -16,6 +16,7 @@ import hmac
 import importlib.util
 import io
 import pathlib
+import re
 import sys
 import tempfile
 import time
@@ -24,44 +25,79 @@ import uuid
 
 import streamlit as st
 
-import cloud_client as cloud
+
+
+def _sans_accent(texte):
+    return "".join(c for c in unicodedata.normalize("NFKD", texte) if not unicodedata.combining(c))
+
+
+def _nom_de_base(fichier):
+    """« Trésorerie_core (1).py » → « tresorerie_core » : retrouve un fichier mal nommé au dépôt sur GitHub."""
+    base = _sans_accent(fichier.stem).lower()
+    base = re.sub(r"\s*\(\d+\)$", "", base)
+    return re.sub(r"[\s_-]*(copie|copy)$", "", base)
+
+
+def _charger(nom, attribut, exige=None):
+    """
+    Charge la version LA PLUS RÉCENTE (plus grand numéro `attribut`) parmi les fichiers « nom.py », « nom (1).py »,
+    « trésorerie_core.py »… présents sur GitHub : une copie mal nommée ou en double ne bloque plus l'application.
+    """
+    ici = pathlib.Path(__file__).resolve().parent
+    meilleur, meilleur_v = None, -1
+    for i, fichier in enumerate(sorted(ici.glob("*.py"))):
+        if _nom_de_base(fichier) != nom:
+            continue
+        nom_mod = f"{nom}__{i}"
+        try:
+            spec = importlib.util.spec_from_file_location(nom_mod, fichier)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[nom_mod] = module
+            spec.loader.exec_module(module)
+        except Exception:  # noqa: BLE001
+            continue
+        if exige and not hasattr(module, exige):
+            continue
+        v = getattr(module, attribut, 0)
+        if meilleur is None or v > meilleur_v:
+            meilleur, meilleur_v = module, v
+    if meilleur is None:
+        raise ModuleNotFoundError(f"{nom}.py est introuvable (ou illisible) dans le dépôt GitHub.")
+    sys.modules[nom] = meilleur
+    return meilleur
+
+
+def _diagnostic():
+    """Liste des fichiers du dépôt avec leur numéro de version : montre d'un coup d'œil ce qui n'est pas à jour."""
+    ici = pathlib.Path(__file__).resolve().parent
+    lignes = []
+    for f in sorted(ici.glob("*.py")) + sorted(ici.glob("requirements*.txt")):
+        try:
+            t = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        v = re.search(r"^(?:CORE_VERSION|CLIENT_VERSION)\s*=\s*(\d+)", t, re.M) or re.search(r"Version (\d+) ·", t)
+        lignes.append(f"{f.name:32s} " + (f"version {v.group(1)}" if v else ("" if f.suffix == ".txt" else "ancienne version (sans numéro)")))
+    return "\n".join(lignes)
 
 
 def _charger_core():
-    """
-    Charge la version À JOUR de tresorerie_core.py, même si GitHub en garde plusieurs exemplaires
-    (nom avec ou sans accent : trésorerie_core.py).
-    """
-    ici = pathlib.Path(__file__).resolve().parent
+    return _charger("tresorerie_core", "CORE_VERSION", exige="prepare_justificatif")
 
-    def sans_accent(texte):
-        return "".join(c for c in unicodedata.normalize("NFKD", texte) if not unicodedata.combining(c))
 
-    vus = []
-    try:
-        import tresorerie_core as exact
-        if hasattr(exact, "prepare_justificatif"):
-            return exact
-        vus.append("tresorerie_core.py (ancienne version)")
-    except ModuleNotFoundError:
-        pass
-    for i, fichier in enumerate(sorted(ici.glob("*.py"))):
-        if sans_accent(fichier.stem) != "tresorerie_core":
-            continue
-        nom = f"tresorerie_core_{i}"
-        spec = importlib.util.spec_from_file_location(nom, fichier)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[nom] = module
-        spec.loader.exec_module(module)
-        if hasattr(module, "prepare_justificatif"):
-            sys.modules["tresorerie_core"] = module
-            return module
-        vus.append(f"{fichier.name} (ancienne version)")
-    raise ModuleNotFoundError("Version à jour de tresorerie_core.py introuvable. Fichiers vus : "
-                              + (", ".join(vus) or "aucun"))
+try:
+    cloud = _charger("cloud_client", "CLIENT_VERSION")
+    _ERREUR_CLOUD = ""
+except Exception as _e:  # noqa: BLE001
+    cloud, _ERREUR_CLOUD = None, str(_e)
 
 
 st.set_page_config(page_title="Factures jardins familiaux", page_icon="🧾", layout="centered")
+if cloud is None:
+    st.error(f"Démarrage impossible : {_ERREUR_CLOUD}")
+    st.caption("Fichiers trouvés sur GitHub :")
+    st.code(_diagnostic(), language=None)
+    st.stop()
 MOIS = ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre",
         "Octobre", "Novembre", "Décembre"]
 
@@ -178,6 +214,8 @@ if getattr(core, "CORE_VERSION", 0) < 28 or getattr(cloud, "CLIENT_VERSION", 0) 
     st.error("⚠️ Les fichiers de l'application ne sont pas tous à jour sur GitHub. Déposez ENSEMBLE app_mobile.py, "
              "tresorerie_core.py, cloud_client.py et requirements.txt (« Commit changes »), puis attendez 3 minutes. "
              f"(module {getattr(core, 'CORE_VERSION', 'ancien')} · client {getattr(cloud, 'CLIENT_VERSION', 'ancien')})")
+    st.caption("Fichiers trouvés sur GitHub (il faut : tresorerie_core.py version 28 ou plus, cloud_client.py version 3 ou plus) :")
+    st.code(_diagnostic(), language=None)
     st.stop()
 
 
@@ -428,7 +466,7 @@ def ecran_versement():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 16 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 17 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
