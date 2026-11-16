@@ -389,16 +389,21 @@ def load_document(data: bytes, filename: str = "", max_pages: int = 5):
         raise OcrUnavailable("Lecture des PDF : installez PyMuPDF (pip install pymupdf).") from e
 
     doc = fitz.open(stream=data, filetype="pdf")
-    pages = [p for i, p in enumerate(doc) if i < max_pages]
+    n = len(doc)
+    if n == 0:
+        raise ValueError("Ce PDF ne contient aucune page.")
 
     def render(page, dpi):
         pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72))
         return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
-    text = "\n".join(p.get_text("text") for p in pages).strip()
+    pages_texte = sorted(set(range(min(n, 8))) | {n - 1})           # texte : 8 premières pages + la dernière (totaux)
+    text = "\n".join(doc[i].get_text("text") for i in pages_texte).strip()
     if len(text) >= 40:                       # PDF avec couche texte
-        return render(pages[0], 110), text, []
-    images = [render(p, 200) for p in pages]  # PDF scanné → OCR
+        return render(doc[0], 110), text, []
+    # PDF scanné → OCR de la première page et de la dernière seulement (un document de 8 pages ne bloque plus l'écran)
+    pages_ocr = [0] if n == 1 else [0, n - 1]
+    images = [render(doc[i], 170) for i in pages_ocr]
     return images[0], None, images
 
 
@@ -719,12 +724,11 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
     if engine.lower().startswith("easy"):
         texte = run_ocr(images, engine)
     else:
-        morceaux = []
+        morceaux, mots_pages = [], []
         for i_im, im in enumerate(images):
             t_im, mots = ocr_donnees(im)
             morceaux.append(t_im)
-            if total is None:
-                total = find_total_in_words(mots)
+            mots_pages.append(mots)
             if i_im == 0:
                 mots_premiere = mots
                 try:
@@ -732,6 +736,12 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
                 except Exception:  # noqa: BLE001      l'en-tête est un plus : jamais bloquant
                     entete = []
         texte = "\n".join(morceaux)
+        for mots in reversed(mots_pages):            # le montant à payer se trouve sur la dernière page
+            total = find_total_in_words(mots)
+            if total:
+                break
+    multi = len(images) > 1 and not engine.lower().startswith("easy")
+    fin_texte = morceaux[-1] if multi else None      # texte de la dernière page : base du calcul des montants
     if images and not engine.lower().startswith("easy") and time.time() - debut < 18 \
             and not find_invoice_number(texte + "\n" + "\n".join(entete)):
         try:                                        # n° de facture introuvable : on relit le haut de la page, agrandi
@@ -747,18 +757,25 @@ def read_invoice(images, engine: str = "Tesseract") -> dict:
             bas = im.crop((0, int(im.size[1] * 0.50), im.size[0], im.size[1]))
             if bas.size[0] < 2400:
                 bas = bas.resize((2400, int(bas.size[1] * 2400 / bas.size[0])), Image.LANCZOS)
-            texte += "\n" + ocr_donnees(bas, psm=6)[0]
+            bas_texte = ocr_donnees(bas, psm=6)[0]
+            texte += "\n" + bas_texte
+            if multi:
+                fin_texte += "\n" + bas_texte
         except Exception:  # noqa: BLE001
             pass
-    meilleur, candidats = find_amount(texte)
-    if meilleur is None and total is None and not engine.lower().startswith("easy") and time.time() - debut < 15:
-        texte += "\n" + run_ocr(images, engine, psm=4)          # 2e passe seulement si la 1re a été rapide
+    base = fin_texte if multi else texte             # plusieurs pages : montants lus sur la dernière page seulement
+    meilleur, candidats = find_amount(base)
+    if multi and meilleur is None:
         meilleur, candidats = find_amount(texte)
-    somme = _total_par_somme([float(m.group(0).replace(",", ".")) for m in re.finditer(r"\d+[.,]\d{2}", texte)])
+    if meilleur is None and total is None and not engine.lower().startswith("easy") and time.time() - debut < 15:
+        texte += "\n" + run_ocr(images[-1:], engine, psm=4)     # 2e passe seulement si la 1re a été rapide
+        base = (fin_texte + "\n" + texte.splitlines()[-1]) if multi else texte
+        meilleur, candidats = find_amount(texte)
+    somme = _total_par_somme([float(m.group(0).replace(",", ".")) for m in re.finditer(r"\d+[.,]\d{2}", base)])
     final = total or meilleur
     if final is not None and somme and round(final, 2) in somme[1] and round(final, 2) != somme[0]:
         final = somme[0]                    # ex. 3,88 (TVA) ou 19,42 (HT) repéré à tort : 19,42 + 3,88 = 23,30
-    tri = triplet_tva(texte.splitlines())
+    tri = triplet_tva(base.splitlines()) or (triplet_tva(texte.splitlines()) if multi else None)
     detail_total = ""
     if tri:
         final = tri[2]                              # le contrôle HT + TVA = TTC l'emporte sur toute autre lecture
@@ -864,11 +881,12 @@ def triplet_tva(lignes):
                 continue
             ttc = round(ht + tva, 2)
             lu = ttc in valeurs
-            if lu or (proche(ht) and proche(tva)):
-                trouves.append((lu, ttc, ht, tva))
+            etiquetes = proche(ht) and proche(tva)          # HT et TVA lus à côté d'un mot « HT » / « TVA »
+            if lu or etiquetes:
+                trouves.append((etiquetes, lu, ttc, ht, tva))
     if not trouves:
         return None
-    lu, ttc, ht, tva = max(trouves)
+    etiquetes, lu, ttc, ht, tva = max(trouves)             # d'abord les montants étiquetés : les prix d'articles ne s'y substituent pas
     return ht, tva, ttc, lu
 
 
@@ -988,6 +1006,69 @@ def suggest_category(text: str, labels: list[str]) -> int | None:
     return best_i
 
 
+def _page_a4(data: bytes) -> Image.Image:
+    """Une photo → une page prête pour le PDF (orientation corrigée, 2400 px maximum)."""
+    img = Image.open(io.BytesIO(data))
+    try:
+        img.draft("RGB", (2600, 2600))
+    except Exception:  # noqa: BLE001
+        pass
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    img.thumbnail((2400, 2400), Image.LANCZOS)
+    return img
+
+
+def _pdf_de_pages(pages: list, qualite: int = 80) -> bytes:
+    """Assemble des pages (images PIL) en un seul PDF, dans l'ordre."""
+    w, h = pages[0].size
+    page_l, page_h = (8.27, 11.69) if h >= w else (11.69, 8.27)
+    sortie = io.BytesIO()
+    pages[0].save(sortie, "PDF", save_all=True, append_images=pages[1:], resolution=max(w / page_l, h / page_h), quality=qualite)
+    return sortie.getvalue()
+
+
+def fusionner_pages(fichiers: list):
+    """
+    fichiers : [(nom, octets), …] dans l'ordre. Un seul fichier : rendu tel quel. Plusieurs photos : un seul PDF
+    (une page par photo). Un PDF mélangé à d'autres fichiers est refusé avec un message clair.
+    Retourne (octets, nom).
+    """
+    if not fichiers:
+        raise ValueError("Aucun fichier.")
+    if len(fichiers) == 1:
+        return fichiers[0][1], fichiers[0][0]
+    if any(n.lower().endswith(".pdf") or d[:5] == b"%PDF-" for n, d in fichiers):
+        raise ValueError("Plusieurs fichiers dont un PDF : envoyez soit un seul PDF, soit plusieurs photos.")
+    if len(fichiers) > 12:
+        raise ValueError("12 pages au maximum par envoi.")
+    return _pdf_de_pages([_page_a4(d) for _, d in fichiers]), "justificatif.pdf"
+
+
+def nb_pages_pdf(data: bytes):
+    """Nombre de pages d'un PDF, ou None si on ne peut pas le lire."""
+    try:
+        import fitz
+        return len(fitz.open(stream=data, filetype="pdf"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pdf_leger(data: bytes, max_octets: int = 3_000_000, max_pages: int = 15) -> bytes:
+    """PDF trop lourd pour un envoi depuis un téléphone : on le reconstruit en images allégées, TOUTES les pages conservées."""
+    if len(data) <= max_octets:
+        return data
+    try:
+        import fitz
+        doc = fitz.open(stream=data, filetype="pdf")
+        pages = []
+        for i in range(min(len(doc), max_pages)):
+            pix = doc[i].get_pixmap(matrix=fitz.Matrix(130 / 72, 130 / 72))
+            pages.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
+        return _pdf_de_pages(pages, 70) if pages else data
+    except Exception:  # noqa: BLE001      sans PyMuPDF ou PDF illisible : on garde l'original
+        return data
+
+
 def prepare_justificatif(data: bytes, filename: str, preview: Image.Image, max_pdf: int = 4_000_000):
     """
     Pièce justificative à conserver : (octets, type MIME).
@@ -996,6 +1077,10 @@ def prepare_justificatif(data: bytes, filename: str, preview: Image.Image, max_p
     is_pdf = filename.lower().endswith(".pdf") or data[:5] == b"%PDF-"
     if is_pdf and len(data) <= max_pdf:
         return data, "application/pdf"
+    if is_pdf:                                       # PDF lourd : allégé, toutes les pages conservées
+        leger = pdf_leger(data, max_octets=max_pdf)
+        if leger is not data and len(leger) <= max_pdf * 1.5:
+            return leger, "application/pdf"
     img = ImageOps.exif_transpose(preview).convert("RGB")
     img.thumbnail((1600, 1600))
     out = io.BytesIO()
@@ -1542,7 +1627,7 @@ def appliquer_regle_fournisseurs(path, sheet: str) -> dict:
 # ════════════════════════════════════════════════════════════════════════════
 #  RAPPORT DE SYNTHÈSE (réunions de l'association)
 # ════════════════════════════════════════════════════════════════════════════
-CORE_VERSION = 27                                  # doit correspondre à VERSION_PC de app.py
+CORE_VERSION = 28                                  # doit correspondre à VERSION_PC de app.py
 NB = "\u00a0"                                    # espace insécable
 LARGEUR_RAPPORT = 76                              # largeur des lignes du rapport (retour à la ligne maîtrisé)
 

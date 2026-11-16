@@ -174,14 +174,25 @@ with st.spinner("Chargement…"):
         st.stop()
 
 
+if getattr(core, "CORE_VERSION", 0) < 28 or getattr(cloud, "CLIENT_VERSION", 0) < 3:
+    st.error("⚠️ Les fichiers de l'application ne sont pas tous à jour sur GitHub. Déposez ENSEMBLE app_mobile.py, "
+             "tresorerie_core.py, cloud_client.py et requirements.txt (« Commit changes »), puis attendez 3 minutes. "
+             f"(module {getattr(core, 'CORE_VERSION', 'ancien')} · client {getattr(cloud, 'CLIENT_VERSION', 'ancien')})")
+    st.stop()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def categories(url: str, token: str) -> list[str]:
-    return cloud.get_categories(url, token)
+    return list(cloud.get_categories(url, token) or [])
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def categories_entrees(url: str, token: str) -> list[str]:
-    return cloud.get_categories(url, token, kind="entrees")
+    """Catégories des versements : liste vide (et non un plantage) si elles ne sont pas disponibles."""
+    try:
+        return list(cloud.get_categories(url, token, kind="entrees") or [])
+    except (cloud.CloudError, TypeError, KeyError, AttributeError):
+        return []
 
 
 def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
@@ -211,10 +222,42 @@ def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
             "paiement": champs["paiement"], "floue": bool(qualite and qualite["floue"])}
 
 
+def stocker_envois(cle_sig: str, cle_recu: str, fichiers) -> None:
+    """
+    Mémorise le ou les fichiers reçus : une photo ou un PDF tel quel ; plusieurs photos réunies en un seul PDF
+    (une page par photo, dans l'ordre). Une erreur est mémorisée pour être affichée, sans jamais faire planter la page.
+    """
+    if not fichiers:
+        return
+    signature = tuple((f.name, f.size) for f in fichiers)
+    if st.session_state.get(cle_sig) == signature:                  # une seule fois par lot de fichiers
+        return
+    st.session_state[cle_sig] = signature
+    try:
+        lots = []
+        for f in fichiers:
+            brut = f.getvalue()
+            try:
+                brut = core.reduire_photo(brut, f.name)             # photo réduite : peu de mémoire, envoi rapide
+            except Exception:  # noqa: BLE001
+                pass
+            lots.append((f.name, brut))
+        st.session_state[cle_recu] = core.fusionner_pages(lots)
+        st.session_state.pop(cle_recu + "_erreur", None)
+    except Exception as e:  # noqa: BLE001
+        st.session_state[cle_recu + "_erreur"] = str(e)
+
+
+def libelle_document(data: bytes, nom: str) -> str:
+    """« 3 pages, 850 Ko » pour l'accusé de réception."""
+    pages = core.nb_pages_pdf(data) if (nom.lower().endswith(".pdf") or data[:5] == b"%PDF-") else 1
+    return (f"{pages} page{'s' if pages and pages > 1 else ''}, " if pages else "") + f"{max(1, len(data) // 1024)} Ko"
+
+
 def photo_a_envoyer(raw: bytes, nom: str, lect: dict | None):
-    """(octets, type) du justificatif conservé : PDF d'origine, ou la photo (recadrée) convertie en PDF."""
+    """(octets, type) du justificatif conservé : PDF d'origine (allégé s'il est lourd), ou la photo (recadrée) en PDF."""
     if nom.lower().endswith(".pdf") or raw[:5] == b"%PDF-":
-        return raw, "application/pdf"
+        return core.pdf_leger(raw), "application/pdf"
     source = lect["preview_jpeg"] if lect and lect.get("preview_jpeg") else raw
     try:
         return core.en_pdf(source, "photo.jpg"), "application/pdf"
@@ -254,10 +297,7 @@ def factures_recues():
                        "Catégorie": r["categorie"], "Montant (€)": float(r["montant"]),
                        "Photo": r.get("photo_url") or None,
                        "Remarque": "Doublon possible" if doublon else "", "id": r["id"]})
-    try:
-        cats_e = categories_entrees(SCRIPT_URL, TOKEN)
-    except cloud.CloudError:
-        cats_e = []
+    cats_e = categories_entrees(SCRIPT_URL, TOKEN)
     options = list(cats) + [c for c in cats_e if c not in cats]
     options += sorted({x["Catégorie"] for x in lignes if x["Catégorie"] not in options})
     edite = st.data_editor(
@@ -302,31 +342,22 @@ def ecran_versement():
     auteur_v = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
     n = st.session_state.get("nv", 0)
     st.caption("Touchez le bouton, puis choisissez « Prendre une photo » (iPhone) ou « Appareil photo » (Android).")
-    envoi_v = st.file_uploader("📷 Photo du ticket de dépôt (ou PDF)", type=["jpg", "jpeg", "png", "pdf"], key=f"envoi_v_{n}")
-    if envoi_v:
-        signature = (envoi_v.name, envoi_v.size)
-        if st.session_state.get(f"sigv_{n}") != signature:             # une seule fois par fichier
-            st.session_state[f"sigv_{n}"] = signature
-            brut = envoi_v.getvalue()
-            try:
-                brut = core.reduire_photo(brut, envoi_v.name)
-            except Exception:  # noqa: BLE001
-                pass
-            st.session_state[f"recuv_{n}"] = (brut, envoi_v.name)
+    envoi_v = st.file_uploader("📷 Photo du ticket de dépôt (ou PDF)", type=["jpg", "jpeg", "png", "pdf"],
+                               accept_multiple_files=True, key=f"envoi_v_{n}")
+    stocker_envois(f"sigv_{n}", f"recuv_{n}", envoi_v)
+    if st.session_state.get(f"recuv_{n}_erreur"):
+        st.error(st.session_state[f"recuv_{n}_erreur"])
     data, name = st.session_state.get(f"recuv_{n}", (None, ""))
     sans_ticket = st.checkbox("Je n'ai pas de ticket", key=f"sans_{n}") if data is None else False
     if data is None and not sans_ticket:
         st.info("Ajoutez la photo du ticket : le formulaire s'affichera aussitôt.")
         return
     if data:
-        st.success(f"📎 Ticket reçu ({max(1, len(data) // 1024)} Ko). Complétez le formulaire ci-dessous.")
-    try:
-        cats_e = categories_entrees(SCRIPT_URL, TOKEN)
-    except cloud.CloudError as e:
-        st.error(str(e))
-        return
+        st.success(f"📎 Ticket reçu ({libelle_document(data, name)}). Complétez le formulaire ci-dessous.")
+    cats_e = categories_entrees(SCRIPT_URL, TOKEN)
     if not cats_e:
-        st.warning("La liste des catégories n'est pas encore disponible : le trésorier doit d'abord ouvrir l'application sur son PC.")
+        st.warning("La liste des catégories de versement n'est pas encore disponible : le trésorier doit d'abord ouvrir "
+                   "l'application sur son PC (et mettre à jour le script Google).")
         return
     fh = hashlib.md5(data).hexdigest()[:10] if data else "sans"
     cle = f"v_{n}_{fh}"
@@ -397,7 +428,7 @@ def ecran_versement():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 15 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 16 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -431,17 +462,12 @@ else:
     st.caption("Une photo de la galerie, ou un document PDF.")
     types, libelle = ["pdf", "jpg", "jpeg", "png"], "📎 Choisir une photo ou un document"
 
-envoi = st.file_uploader(libelle, type=types, key=f"envoi_{mode[:1]}_{n}")
-if envoi:
-    signature = (envoi.name, envoi.size)
-    if st.session_state.get(f"sig_{n}") != signature:             # une seule fois par fichier
-        st.session_state[f"sig_{n}"] = signature
-        brut = envoi.getvalue()
-        try:
-            brut = core.reduire_photo(brut, envoi.name)             # photo réduite : peu de mémoire, envoi rapide
-        except Exception:  # noqa: BLE001
-            pass
-        st.session_state[f"recu_{n}"] = (brut, envoi.name)         # mémorisé dès la réception
+st.caption("Facture sur plusieurs pages ? Choisissez toutes les photos d'un coup (ou ajoutez-les l'une après l'autre) : "
+           "elles sont réunies en un seul PDF, dans l'ordre.")
+envoi = st.file_uploader(libelle, type=types, accept_multiple_files=True, key=f"envoi_{mode[:1]}_{n}")
+stocker_envois(f"sig_{n}", f"recu_{n}", envoi)
+if st.session_state.get(f"recu_{n}_erreur"):
+    st.error(st.session_state[f"recu_{n}_erreur"])
 data, name = st.session_state.get(f"recu_{n}", (None, ""))
 
 if data is None:
@@ -450,7 +476,7 @@ if data is None:
 
 fh = hashlib.md5(data).hexdigest()[:10]
 entry_id = st.session_state.setdefault(f"id_{fh}", uuid.uuid4().hex)   # même id si on touche deux fois « Envoyer »
-st.success(f"📎 Document reçu ({max(1, len(data) // 1024)} Ko). Complétez le formulaire ci-dessous.")
+st.success(f"📎 Document reçu ({libelle_document(data, name)}). Complétez le formulaire ci-dessous.")
 
 try:
     cats = categories(SCRIPT_URL, TOKEN)

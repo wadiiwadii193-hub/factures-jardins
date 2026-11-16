@@ -14,6 +14,7 @@ from pathlib import Path
 
 import requests
 
+CLIENT_VERSION = 3                                   # doit correspondre à l'attente de l'application
 TIMEOUT = 45
 CONFIG_FILE = "config_cloud.txt"
 APPLIED_FILE = "ids_appliques.txt"
@@ -124,9 +125,12 @@ def set_categories(url: str, token: str, categories, kind: str = "sorties") -> i
 
 
 def get_categories(url: str, token: str, kind: str = "sorties") -> list[str]:
+    """Liste des catégories (jamais None : liste vide si le script n'en renvoie pas)."""
     if kind == "entrees":
-        return _call(url, token, "get_categories", {"kind": "entrees"})["categories"]
-    return _call(url, token, "get_categories", method="GET")["categories"]
+        data = _call(url, token, "get_categories", {"kind": "entrees"})
+    else:
+        data = _call(url, token, "get_categories", method="GET")
+    return [str(x).strip() for x in (data.get("categories") or []) if str(x).strip()]
 
 
 # ---- mémoire locale des lignes déjà reportées dans Excel (garde-fou anti-doublon) ----
