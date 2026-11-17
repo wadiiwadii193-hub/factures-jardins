@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import base64
 import json
+import re
+import time
 import os
 import uuid
 from pathlib import Path
 
 import requests
 
-CLIENT_VERSION = 3                                   # doit correspondre à l'attente de l'application
+CLIENT_VERSION = 4                                   # doit correspondre à l'attente de l'application
 TIMEOUT = 45
 CONFIG_FILE = "config_cloud.txt"
 APPLIED_FILE = "ids_appliques.txt"
@@ -39,24 +41,69 @@ def setting(name: str, default: str = "") -> str:
     return default
 
 
+def _propre(x):
+    """Rend la requête sûre pour le script Google : NaN, valeurs vides de pandas, dates et nombres numpy → JSON valide."""
+    if x is None or isinstance(x, (str, bool, int)):
+        return x
+    if isinstance(x, float):
+        return None if x != x or x in (float("inf"), float("-inf")) else x
+    if isinstance(x, dict):
+        return {str(k): _propre(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple, set)):
+        return [_propre(v) for v in x]
+    if hasattr(x, "isoformat"):
+        try:
+            return x.isoformat()
+        except Exception:  # noqa: BLE001      (NaT…)
+            return None
+    if hasattr(x, "item"):                            # nombre numpy
+        try:
+            return _propre(x.item())
+        except Exception:  # noqa: BLE001
+            return None
+    return str(x)
+
+
+def _extrait(texte: str, n: int = 170) -> str:
+    """Début lisible d'une réponse non JSON (page d'erreur Google) pour comprendre ce qui ne va pas."""
+    brut = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", texte or "", flags=re.S | re.I)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", brut)).strip()[:n]
+
+
 def _call(url: str, token: str, action: str, payload: dict | None = None, method: str = "POST") -> dict:
-    body = {"token": token, "action": action, **(payload or {})}
-    try:
-        if method == "GET":
-            r = requests.get(url, params=body, timeout=TIMEOUT)
+    body = _propre({"token": token, "action": action, **(payload or {})})
+    erreur = ""
+    for tentative in (1, 2):                          # un 2ᵉ essai : Google renvoie parfois une page vide ou une erreur passagère
+        try:
+            if method == "GET":
+                r = requests.get(url, params=body, timeout=TIMEOUT)
+            else:
+                r = requests.post(url, data=json.dumps(body, allow_nan=False), timeout=TIMEOUT,
+                                  headers={"Content-Type": "text/plain;charset=utf-8"})
+        except requests.RequestException as e:
+            erreur = f"Connexion impossible avec le Google Sheet : {e}"
         else:
-            r = requests.post(url, data=json.dumps(body), timeout=TIMEOUT,
-                              headers={"Content-Type": "text/plain;charset=utf-8"})
-        r.raise_for_status()
-        data = r.json()
-    except requests.RequestException as e:
-        raise CloudError(f"Connexion impossible avec le Google Sheet : {e}") from e
-    except ValueError as e:
-        raise CloudError("Réponse inattendue : l'adresse du script (SCRIPT_URL) est-elle correcte "
-                         "et le déploiement ouvert à « Tout le monde » ?") from e
-    if not data.get("ok"):
-        raise CloudError(data.get("error", "Erreur inconnue côté Google Sheet."))
-    return data
+            r.encoding = "utf-8"                      # les pages de Google sont en UTF-8 (accents lisibles dans les messages)
+            if r.status_code >= 500 or r.status_code == 429:
+                erreur = f"Google a répondu « erreur {r.status_code} » : {_extrait(r.text) or 'réponse vide'}"
+            elif r.status_code >= 400:
+                raise CloudError(f"Google a répondu « erreur {r.status_code} » : {_extrait(r.text) or 'réponse vide'}. "
+                                 "L'adresse du script (SCRIPT_URL) est-elle correcte ?")
+            else:
+                try:
+                    data = r.json()
+                except ValueError:
+                    erreur = (f"Réponse inattendue de Google (au lieu de données) : « {_extrait(r.text) or 'réponse vide'} ». "
+                              "Dans Apps Script : Déployer › Gérer les déploiements › crayon › Nouvelle version › Déployer, "
+                              "avec l'accès « Tout le monde ».")
+                else:
+                    if not isinstance(data, dict) or not data.get("ok"):
+                        raise CloudError((data or {}).get("error", "Erreur inconnue côté Google Sheet.") if isinstance(data, dict)
+                                         else "Réponse inattendue du Google Sheet.")
+                    return data
+        if tentative == 1:
+            time.sleep(1.5)
+    raise CloudError(erreur)
 
 
 def ping(url: str, token: str) -> bool:

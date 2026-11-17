@@ -210,11 +210,11 @@ with st.spinner("Chargement…"):
         st.stop()
 
 
-if getattr(core, "CORE_VERSION", 0) < 28 or getattr(cloud, "CLIENT_VERSION", 0) < 3:
+if getattr(core, "CORE_VERSION", 0) < 28 or getattr(cloud, "CLIENT_VERSION", 0) < 4:
     st.error("⚠️ Les fichiers de l'application ne sont pas tous à jour sur GitHub. Déposez ENSEMBLE app_mobile.py, "
              "tresorerie_core.py, cloud_client.py et requirements.txt (« Commit changes »), puis attendez 3 minutes. "
              f"(module {getattr(core, 'CORE_VERSION', 'ancien')} · client {getattr(cloud, 'CLIENT_VERSION', 'ancien')})")
-    st.caption("Fichiers trouvés sur GitHub (il faut : tresorerie_core.py version 28 ou plus, cloud_client.py version 3 ou plus) :")
+    st.caption("Fichiers trouvés sur GitHub (il faut : tresorerie_core.py version 28 ou plus, cloud_client.py version 4 ou plus) :")
     st.code(_diagnostic(), language=None)
     st.stop()
 
@@ -267,6 +267,8 @@ def stocker_envois(cle_sig: str, cle_recu: str, fichiers) -> None:
     """
     if not fichiers:
         return
+    if not isinstance(fichiers, (list, tuple)):           # un seul fichier : même traitement
+        fichiers = [fichiers]
     signature = tuple((f.name, f.size) for f in fichiers)
     if st.session_state.get(cle_sig) == signature:                  # une seule fois par lot de fichiers
         return
@@ -466,7 +468,7 @@ def ecran_versement():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 17 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 18 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
