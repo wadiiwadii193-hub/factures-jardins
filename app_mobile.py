@@ -210,11 +210,11 @@ with st.spinner("Chargement…"):
         st.stop()
 
 
-if getattr(core, "CORE_VERSION", 0) < 28 or getattr(cloud, "CLIENT_VERSION", 0) < 4:
+if getattr(core, "CORE_VERSION", 0) < 28 or getattr(cloud, "CLIENT_VERSION", 0) < 5:
     st.error("⚠️ Les fichiers de l'application ne sont pas tous à jour sur GitHub. Déposez ENSEMBLE app_mobile.py, "
              "tresorerie_core.py, cloud_client.py et requirements.txt (« Commit changes »), puis attendez 3 minutes. "
              f"(module {getattr(core, 'CORE_VERSION', 'ancien')} · client {getattr(cloud, 'CLIENT_VERSION', 'ancien')})")
-    st.caption("Fichiers trouvés sur GitHub (il faut : tresorerie_core.py version 28 ou plus, cloud_client.py version 4 ou plus) :")
+    st.caption("Fichiers trouvés sur GitHub (il faut : tresorerie_core.py version 28 ou plus, cloud_client.py version 5 ou plus) :")
     st.code(_diagnostic(), language=None)
     st.stop()
 
@@ -317,6 +317,10 @@ def factures_recues():
     except cloud.CloudError as e:
         st.error(str(e))
         return
+    _v = getattr(cloud, "DERNIERE_VERSION_SCRIPT", None)
+    st.caption(f"Script Google : version {_v}" if _v else
+               "⚠️ Script Google : ancienne version (ou mauvaise adresse). Redéployez le script (Déployer › Gérer les "
+               "déploiements › Nouvelle version) et vérifiez SCRIPT_URL dans les Secrets Streamlit.")
     if validees:
         st.info(f"✅ {len(validees)} facture(s) validée(s) : elles s'ajouteront au tableau Excel "
                 "dès que vous ouvrirez l'application sur votre PC.")
@@ -468,7 +472,7 @@ def ecran_versement():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 18 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 19 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:

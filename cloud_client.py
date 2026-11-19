@@ -16,7 +16,8 @@ from pathlib import Path
 
 import requests
 
-CLIENT_VERSION = 4                                   # doit correspondre à l'attente de l'application
+DERNIERE_VERSION_SCRIPT = None                      # numéro du script Google d'après sa dernière réponse (None : ancien script)
+CLIENT_VERSION = 5                                   # doit correspondre à l'attente de l'application
 TIMEOUT = 45
 CONFIG_FILE = "config_cloud.txt"
 APPLIED_FILE = "ids_appliques.txt"
@@ -71,6 +72,7 @@ def _extrait(texte: str, n: int = 170) -> str:
 
 
 def _call(url: str, token: str, action: str, payload: dict | None = None, method: str = "POST") -> dict:
+    global DERNIERE_VERSION_SCRIPT
     body = _propre({"token": token, "action": action, **(payload or {})})
     erreur = ""
     for tentative in (1, 2):                          # un 2ᵉ essai : Google renvoie parfois une page vide ou une erreur passagère
@@ -97,6 +99,8 @@ def _call(url: str, token: str, action: str, payload: dict | None = None, method
                               "Dans Apps Script : Déployer › Gérer les déploiements › crayon › Nouvelle version › Déployer, "
                               "avec l'accès « Tout le monde ».")
                 else:
+                    if isinstance(data, dict):
+                        DERNIERE_VERSION_SCRIPT = data.get("script_version")        # absent : ancien script
                     if not isinstance(data, dict) or not data.get("ok"):
                         raise CloudError((data or {}).get("error", "Erreur inconnue côté Google Sheet.") if isinstance(data, dict)
                                          else "Réponse inattendue du Google Sheet.")

@@ -1627,7 +1627,7 @@ def appliquer_regle_fournisseurs(path, sheet: str) -> dict:
 # ════════════════════════════════════════════════════════════════════════════
 #  RAPPORT DE SYNTHÈSE (réunions de l'association)
 # ════════════════════════════════════════════════════════════════════════════
-CORE_VERSION = 28                                  # doit correspondre à VERSION_PC de app.py
+CORE_VERSION = 29                                  # doit correspondre à VERSION_PC de app.py
 NB = "\u00a0"                                    # espace insécable
 LARGEUR_RAPPORT = 76                              # largeur des lignes du rapport (retour à la ligne maîtrisé)
 
