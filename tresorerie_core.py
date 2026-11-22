@@ -345,9 +345,15 @@ def record_amount(path, sheet: str, which: str, month: int, amount: float, *,
     else:                     # lot de plusieurs lignes : une seule sauvegarde pour tout le lot
         wb.save(path)
         backup = None
+    verifie = None                                  # relecture du fichier enregistré : la case contient-elle bien le montant ?
+    try:
+        lu = openpyxl.load_workbook(path)[sheet][cell.coordinate].value
+        verifie = lu == new or (isinstance(lu, (int, float)) and isinstance(new, (int, float)) and abs(lu - new) < 0.005)
+    except Exception:  # noqa: BLE001
+        verifie = None
     return {"row": row, "col": col, "cell": cell.coordinate, "old": old, "new": new,
             "label": str(ws.cell(row, lay.label_col).value).strip(), "backup": backup, "detail": detail_res,
-            "versement": versement_res}
+            "versement": versement_res, "verifie": verifie}
 
 
 def log_operation(path, **fields):
@@ -1627,7 +1633,7 @@ def appliquer_regle_fournisseurs(path, sheet: str) -> dict:
 # ════════════════════════════════════════════════════════════════════════════
 #  RAPPORT DE SYNTHÈSE (réunions de l'association)
 # ════════════════════════════════════════════════════════════════════════════
-CORE_VERSION = 29                                  # doit correspondre à VERSION_PC de app.py
+CORE_VERSION = 30                                  # doit correspondre à VERSION_PC de app.py
 NB = "\u00a0"                                    # espace insécable
 LARGEUR_RAPPORT = 76                              # largeur des lignes du rapport (retour à la ligne maîtrisé)
 

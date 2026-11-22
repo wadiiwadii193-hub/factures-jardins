@@ -260,18 +260,18 @@ def lire_facture(raw: bytes, nom: str, recadrer: bool, cats: list):
             "paiement": champs["paiement"], "floue": bool(qualite and qualite["floue"])}
 
 
-def stocker_envois(cle_sig: str, cle_recu: str, fichiers) -> None:
+def stocker_envois(cle_sig: str, cle_recu: str, fichiers) -> bool:
     """
     Mémorise le ou les fichiers reçus : une photo ou un PDF tel quel ; plusieurs photos réunies en un seul PDF
     (une page par photo, dans l'ordre). Une erreur est mémorisée pour être affichée, sans jamais faire planter la page.
     """
     if not fichiers:
-        return
+        return False
     if not isinstance(fichiers, (list, tuple)):           # un seul fichier : même traitement
         fichiers = [fichiers]
     signature = tuple((f.name, f.size) for f in fichiers)
     if st.session_state.get(cle_sig) == signature:                  # une seule fois par lot de fichiers
-        return
+        return False
     st.session_state[cle_sig] = signature
     try:
         lots = []
@@ -286,6 +286,62 @@ def stocker_envois(cle_sig: str, cle_recu: str, fichiers) -> None:
         st.session_state.pop(cle_recu + "_erreur", None)
     except Exception as e:  # noqa: BLE001
         st.session_state[cle_recu + "_erreur"] = str(e)
+    return True
+
+
+def envoi_photo(cle: str, libelle: str, camera: bool = True):
+    """
+    Retourne (octets, nom) du document à envoyer.
+    • Appareil photo : UN fichier à la fois et seulement des images : c'est ce qui fait proposer « Appareil photo » sur
+      Android (avec plusieurs fichiers ou un PDF, Android ne le propose plus). Chaque photo ajoute une page.
+    • Fichiers déjà enregistrés (galerie, PDF) : plusieurs photos réunies en un PDF, ou un seul PDF.
+    """
+    pages = st.session_state.setdefault(f"pages_{cle}", [])
+    if camera:
+        photo = st.file_uploader(libelle if not pages else "➕ Ajouter une page (facultatif)", type=["jpg", "jpeg", "png"],
+                                 key=f"cam_{cle}_{len(pages)}")
+        if photo is not None:
+            brut = photo.getvalue()
+            try:
+                brut = core.reduire_photo(brut, photo.name)
+            except Exception:  # noqa: BLE001
+                pass
+            pages.append((photo.name, brut))
+            st.session_state[f"src_{cle}"] = "camera"
+            st.rerun()                               # nouveau bouton vierge : on peut photographier la page suivante
+        if pages:
+            st.caption(f"📄 {len(pages)} page{'s' if len(pages) > 1 else ''} prise{'s' if len(pages) > 1 else ''}. "
+                       "Touchez « Ajouter une page » pour la suivante, ou remplissez le formulaire plus bas.")
+            if st.button("↩️ Retirer la dernière page", key=f"retire_{cle}_{len(pages)}"):
+                pages.pop()
+                st.rerun()
+        with st.expander("📎 Ou choisir des photos / un PDF déjà enregistrés"):
+            fichiers = st.file_uploader("Photos de la galerie (plusieurs possibles) ou un PDF", type=["pdf", "jpg", "jpeg", "png"],
+                                        accept_multiple_files=True, key=f"gal_{cle}")
+    else:
+        fichiers = st.file_uploader(libelle, type=["pdf", "jpg", "jpeg", "png"], accept_multiple_files=True, key=f"gal_{cle}")
+    if stocker_envois(f"sigg_{cle}", f"recug_{cle}", fichiers):
+        st.session_state[f"src_{cle}"] = "fichiers"
+    if not fichiers and st.session_state.get(f"src_{cle}") == "fichiers":      # les fichiers ont été retirés
+        st.session_state.pop(f"recug_{cle}", None)
+        st.session_state.pop(f"sigg_{cle}", None)
+        st.session_state[f"src_{cle}"] = None
+    if st.session_state.get(f"recug_{cle}_erreur"):
+        st.error(st.session_state[f"recug_{cle}_erreur"])
+    if st.session_state.get(f"src_{cle}") == "fichiers" and st.session_state.get(f"recug_{cle}"):
+        return st.session_state[f"recug_{cle}"]
+    if pages:
+        signature = tuple(len(b) for _, b in pages)
+        memo = st.session_state.get(f"fus_{cle}")
+        if not memo or memo[0] != signature:
+            try:
+                memo = (signature, core.fusionner_pages(pages))
+            except Exception as e:  # noqa: BLE001
+                st.error(str(e))
+                return None, ""
+            st.session_state[f"fus_{cle}"] = memo
+        return memo[1]
+    return None, ""
 
 
 def libelle_document(data: bytes, nom: str) -> str:
@@ -386,12 +442,7 @@ def ecran_versement():
     auteur_v = st.text_input("Votre prénom", key="auteur", placeholder="Ex. : Karim")
     n = st.session_state.get("nv", 0)
     st.caption("Touchez le bouton, puis choisissez « Prendre une photo » (iPhone) ou « Appareil photo » (Android).")
-    envoi_v = st.file_uploader("📷 Photo du ticket de dépôt (ou PDF)", type=["jpg", "jpeg", "png", "pdf"],
-                               accept_multiple_files=True, key=f"envoi_v_{n}")
-    stocker_envois(f"sigv_{n}", f"recuv_{n}", envoi_v)
-    if st.session_state.get(f"recuv_{n}_erreur"):
-        st.error(st.session_state[f"recuv_{n}_erreur"])
-    data, name = st.session_state.get(f"recuv_{n}", (None, ""))
+    data, name = envoi_photo(f"v{n}", "📷 Photo du ticket de dépôt")
     sans_ticket = st.checkbox("Je n'ai pas de ticket", key=f"sans_{n}") if data is None else False
     if data is None and not sans_ticket:
         st.info("Ajoutez la photo du ticket : le formulaire s'affichera aussitôt.")
@@ -472,7 +523,7 @@ def ecran_versement():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 19 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 20 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -506,13 +557,8 @@ else:
     st.caption("Une photo de la galerie, ou un document PDF.")
     types, libelle = ["pdf", "jpg", "jpeg", "png"], "📎 Choisir une photo ou un document"
 
-st.caption("Facture sur plusieurs pages ? Choisissez toutes les photos d'un coup (ou ajoutez-les l'une après l'autre) : "
-           "elles sont réunies en un seul PDF, dans l'ordre.")
-envoi = st.file_uploader(libelle, type=types, accept_multiple_files=True, key=f"envoi_{mode[:1]}_{n}")
-stocker_envois(f"sig_{n}", f"recu_{n}", envoi)
-if st.session_state.get(f"recu_{n}_erreur"):
-    st.error(st.session_state[f"recu_{n}_erreur"])
-data, name = st.session_state.get(f"recu_{n}", (None, ""))
+st.caption("Facture sur plusieurs pages ? Photographiez-les l'une après l'autre : elles sont réunies en un seul PDF, dans l'ordre.")
+data, name = envoi_photo(f"f{n}", libelle, camera=not mode.startswith("📎"))
 
 if data is None:
     st.info("Ajoutez une facture : le formulaire s'affichera aussitôt.")
