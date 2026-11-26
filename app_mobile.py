@@ -289,7 +289,87 @@ def stocker_envois(cle_sig: str, cle_recu: str, fichiers) -> bool:
     return True
 
 
-def envoi_photo(cle: str, libelle: str, camera: bool = True):
+CAMERA_ANDROID_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;font-family:Arial,Helvetica,sans-serif">
+<button id="b" style="width:100%;padding:14px 10px;font-size:17px;font-weight:600;border:0;border-radius:10px;background:#e8403c;color:#fff">📷 Ouvrir l'appareil photo</button>
+<div id="m" style="font-size:14px;color:#b00020;margin-top:6px"></div>
+<script>
+(function () {
+  var P = window.parent, D = null, msg = document.getElementById("m");
+  try { D = P.document; D.body; } catch (e) { D = null; }
+  function dire(t) { msg.textContent = t || ""; }
+  function cible() {                       // l'envoi « un seul fichier » de Streamlit (pas celui de la galerie, qui accepte plusieurs fichiers)
+    var choix = null;
+    D.querySelectorAll('input[type="file"]').forEach(function (c) {
+      if (!choix && !c.multiple && /jpe?g|png|image/i.test(c.accept || "")) { choix = c; }
+    });
+    return choix;
+  }
+  document.getElementById("b").addEventListener("click", function () {
+    dire("");
+    if (!D || !P.navigator || !P.navigator.mediaDevices) { dire("Appareil photo intégré indisponible : utilisez « Browse files » puis « Appareil photo »."); return; }
+    if (!cible()) { dire("Zone d'envoi introuvable : utilisez « Browse files »."); return; }
+    ouvrir();
+  });
+  function ouvrir() {
+    var flux = null, fond = D.createElement("div");
+    fond.id = "cam-fond";
+    fond.style.cssText = "position:fixed;left:0;top:0;right:0;bottom:0;background:#000;z-index:2147483647;display:flex;flex-direction:column;font-family:Arial,sans-serif";
+    var v = D.createElement("video");
+    v.setAttribute("playsinline", ""); v.autoplay = true; v.muted = true;
+    v.style.cssText = "flex:1;min-height:0;width:100%;object-fit:contain;background:#000";
+    var barre = D.createElement("div");
+    barre.style.cssText = "display:flex;align-items:center;justify-content:space-between;padding:14px 22px 26px;background:#000;color:#fff";
+    var info = D.createElement("div"); info.style.cssText = "flex:1;font-size:14px;padding-right:10px"; info.textContent = "Facture à plat, bien éclairée, en entier dans l'image";
+    var cap = D.createElement("button"); cap.id = "cam-capture"; cap.textContent = "";
+    cap.style.cssText = "width:74px;height:74px;border-radius:50%;border:5px solid #fff;background:#e8403c;flex:none";
+    var ann = D.createElement("button"); ann.id = "cam-annuler"; ann.textContent = "✕ Annuler";
+    ann.style.cssText = "flex:1;text-align:right;background:none;border:0;color:#fff;font-size:16px";
+    barre.appendChild(info); barre.appendChild(cap); barre.appendChild(ann);
+    fond.appendChild(v); fond.appendChild(barre); D.body.appendChild(fond);
+    function fermer() {
+      if (flux) { flux.getTracks().forEach(function (t) { t.stop(); }); flux = null; }   // la caméra est libérée tout de suite (mémoire)
+      if (fond.parentNode) { fond.parentNode.removeChild(fond); }
+    }
+    ann.addEventListener("click", fermer);
+    P.navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
+      .then(function (s) { flux = s; v.srcObject = s; })
+      .catch(function (e) {
+        info.textContent = "Appareil photo inaccessible (" + (e && e.name ? e.name : "erreur") + "). Autorisez-le dans les réglages du navigateur, ou utilisez « Browse files ».";
+        cap.style.display = "none";
+      });
+    cap.addEventListener("click", function () {
+      var w = v.videoWidth, h = v.videoHeight;
+      if (!w || !h) { return; }
+      var k = Math.min(1, 2000 / Math.max(w, h)), c = D.createElement("canvas");
+      c.width = Math.round(w * k); c.height = Math.round(h * k);
+      c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+      c.toBlob(function (blob) {
+        fermer();
+        if (!blob) { dire("La photo n'a pas pu être prise : réessayez."); return; }
+        var champ = cible();
+        if (!champ) { dire("Zone d'envoi introuvable : utilisez « Browse files »."); return; }
+        var f = new P.File([blob], "photo_" + Date.now() + ".jpg", { type: "image/jpeg" });
+        var dt = new P.DataTransfer(); dt.items.add(f);
+        champ.files = dt.files;
+        champ.dispatchEvent(new P.Event("change", { bubbles: true }));
+      }, "image/jpeg", 0.85);
+    });
+  }
+})();
+</script></body></html>
+"""
+
+
+def est_android() -> bool:
+    """Vrai sur un téléphone Android (d'après le navigateur). Jamais d'erreur : sinon on considère que ce n'est pas Android."""
+    try:
+        return "android" in str(st.context.headers.get("User-Agent", "")).lower()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def envoi_photo(cle: str, libelle: str, camera: bool = True, ouvert: bool = False):
     """
     Retourne (octets, nom) du document à envoyer.
     • Appareil photo : UN fichier à la fois et seulement des images : c'est ce qui fait proposer « Appareil photo » sur
@@ -297,6 +377,12 @@ def envoi_photo(cle: str, libelle: str, camera: bool = True):
     • Fichiers déjà enregistrés (galerie, PDF) : plusieurs photos réunies en un PDF, ou un seul PDF.
     """
     pages = st.session_state.setdefault(f"pages_{cle}", [])
+    if camera and est_android():
+        # Android : l'appareil photo de l'application s'ouvre DANS la page (l'application « Appareil photo » du téléphone
+        # fait recharger la page et perdre la photo). La photo prise est envoyée par la zone d'envoi ci-dessous.
+        import streamlit.components.v1 as components
+        components.html(CAMERA_ANDROID_HTML, height=78)
+        st.caption("Si l'appareil photo ci-dessus ne s'ouvre pas, utilisez « Browse files » ci-dessous.")
     if camera:
         photo = st.file_uploader(libelle if not pages else "➕ Ajouter une page (facultatif)", type=["jpg", "jpeg", "png"],
                                  key=f"cam_{cle}_{len(pages)}")
@@ -315,7 +401,7 @@ def envoi_photo(cle: str, libelle: str, camera: bool = True):
             if st.button("↩️ Retirer la dernière page", key=f"retire_{cle}_{len(pages)}"):
                 pages.pop()
                 st.rerun()
-        with st.expander("📎 Ou choisir des photos / un PDF déjà enregistrés"):
+        with st.expander("📎 Ou choisir des photos / un PDF déjà enregistrés", expanded=ouvert):
             fichiers = st.file_uploader("Photos de la galerie (plusieurs possibles) ou un PDF", type=["pdf", "jpg", "jpeg", "png"],
                                         accept_multiple_files=True, key=f"gal_{cle}")
     else:
@@ -523,7 +609,7 @@ def ecran_versement():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 20 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 21 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
@@ -558,7 +644,7 @@ else:
     types, libelle = ["pdf", "jpg", "jpeg", "png"], "📎 Choisir une photo ou un document"
 
 st.caption("Facture sur plusieurs pages ? Photographiez-les l'une après l'autre : elles sont réunies en un seul PDF, dans l'ordre.")
-data, name = envoi_photo(f"f{n}", libelle, camera=not mode.startswith("📎"))
+data, name = envoi_photo(f"f{n}", libelle, camera=(not mode.startswith("📎")) or est_android(), ouvert=mode.startswith("📎"))
 
 if data is None:
     st.info("Ajoutez une facture : le formulaire s'affichera aussitôt.")
