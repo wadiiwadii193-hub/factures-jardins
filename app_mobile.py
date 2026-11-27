@@ -292,12 +292,12 @@ def stocker_envois(cle_sig: str, cle_recu: str, fichiers) -> bool:
 CAMERA_ANDROID_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;font-family:Arial,Helvetica,sans-serif">
 <button id="b" style="width:100%;padding:14px 10px;font-size:17px;font-weight:600;border:0;border-radius:10px;background:#e8403c;color:#fff">📷 Ouvrir l'appareil photo</button>
-<div id="m" style="font-size:14px;color:#b00020;margin-top:6px"></div>
+<div id="m" style="font-size:15px;line-height:1.35;margin-top:8px;min-height:40px"></div>
 <script>
 (function () {
   var P = window.parent, D = null, msg = document.getElementById("m");
   try { D = P.document; D.body; } catch (e) { D = null; }
-  function dire(t) { msg.textContent = t || ""; }
+  function dire(t, couleur) { msg.textContent = t || ""; msg.style.color = couleur || "#b00020"; }
   function cible() {                       // l'envoi « un seul fichier » de Streamlit (pas celui de la galerie, qui accepte plusieurs fichiers)
     var choix = null;
     D.querySelectorAll('input[type="file"]').forEach(function (c) {
@@ -311,6 +311,35 @@ CAMERA_ANDROID_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta
     if (!cible()) { dire("Zone d'envoi introuvable : utilisez « Browse files »."); return; }
     ouvrir();
   });
+  function envoyer(champ, f) {
+    dire("⏳ Envoi de la photo…", "#555");
+    var dt = new P.DataTransfer(); dt.items.add(f);
+    champ.files = dt.files;                                   // 1re méthode : comme un choix de fichier
+    champ.dispatchEvent(new P.Event("change", { bubbles: true }));
+    var debut = Date.now(), essaye = false;
+    var iv = setInterval(function () {
+      if (!champ.isConnected) {                               // Streamlit a pris la photo : la zone d'envoi est remplacée par une neuve
+        clearInterval(iv); dire("✅ Photo envoyée.", "#1b7f3b"); return;
+      }
+      var conteneur = champ.closest('[data-testid="stFileUploader"]');
+      var enCours = conteneur && conteneur.querySelector('[data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFileName"]');
+      var ecoule = Date.now() - debut;
+      if (!enCours && !essaye && ecoule > 4000) {             // 2e méthode : on « dépose » la photo sur la zone, comme à la souris
+        essaye = true;
+        try {
+          var zone = champ.closest('[data-testid="stFileUploaderDropzone"]') || champ.parentElement;
+          var dt2 = new P.DataTransfer(); dt2.items.add(f);
+          ["dragenter", "dragover", "drop"].forEach(function (n) {
+            zone.dispatchEvent(new P.DragEvent(n, { bubbles: true, cancelable: true, dataTransfer: dt2 }));
+          });
+        } catch (e) {}
+      }
+      if (ecoule > (enCours ? 30000 : 10000)) {
+        clearInterval(iv);
+        dire("⚠️ La photo n'a pas été reçue par l'application. Utilisez « Browse files » ci-dessous.");
+      }
+    }, 300);
+  }
   function ouvrir() {
     var flux = null, fond = D.createElement("div");
     fond.id = "cam-fond";
@@ -349,10 +378,7 @@ CAMERA_ANDROID_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta
         if (!blob) { dire("La photo n'a pas pu être prise : réessayez."); return; }
         var champ = cible();
         if (!champ) { dire("Zone d'envoi introuvable : utilisez « Browse files »."); return; }
-        var f = new P.File([blob], "photo_" + Date.now() + ".jpg", { type: "image/jpeg" });
-        var dt = new P.DataTransfer(); dt.items.add(f);
-        champ.files = dt.files;
-        champ.dispatchEvent(new P.Event("change", { bubbles: true }));
+        envoyer(champ, new P.File([blob], "photo_" + Date.now() + ".jpg", { type: "image/jpeg" }));
       }, "image/jpeg", 0.85);
     });
   }
@@ -381,7 +407,7 @@ def envoi_photo(cle: str, libelle: str, camera: bool = True, ouvert: bool = Fals
         # Android : l'appareil photo de l'application s'ouvre DANS la page (l'application « Appareil photo » du téléphone
         # fait recharger la page et perdre la photo). La photo prise est envoyée par la zone d'envoi ci-dessous.
         import streamlit.components.v1 as components
-        components.html(CAMERA_ANDROID_HTML, height=78)
+        components.html(CAMERA_ANDROID_HTML, height=132)
         st.caption("Si l'appareil photo ci-dessus ne s'ouvre pas, utilisez « Browse files » ci-dessous.")
     if camera:
         photo = st.file_uploader(libelle if not pages else "➕ Ajouter une page (facultatif)", type=["jpg", "jpeg", "png"],
@@ -392,7 +418,9 @@ def envoi_photo(cle: str, libelle: str, camera: bool = True, ouvert: bool = Fals
                 brut = core.reduire_photo(brut, photo.name)
             except Exception:  # noqa: BLE001
                 pass
-            pages.append((photo.name, brut))
+            if st.session_state.get(f"derniere_{cle}") != (photo.name, photo.size):          # jamais deux fois la même photo
+                pages.append((photo.name, brut))
+                st.session_state[f"derniere_{cle}"] = (photo.name, photo.size)
             st.session_state[f"src_{cle}"] = "camera"
             st.rerun()                               # nouveau bouton vierge : on peut photographier la page suivante
         if pages:
@@ -609,7 +637,7 @@ def ecran_versement():
 # ───────────────────────────── Page ─────────────────────────────
 est_tresorier = bool(st.session_state.get("tresorier"))
 _gauche, _droite = st.columns([3, 1])
-_gauche.caption(f"Version 21 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
+_gauche.caption(f"Version 22 · {pathlib.Path(core.__file__).name}" + (" · trésorier" if est_tresorier else ""))
 if _droite.button("🚪 Fermer", key="fermer"):
     fermer_session()
 if "message" in st.session_state:
